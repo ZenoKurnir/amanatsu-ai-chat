@@ -36,9 +36,9 @@ if ($PSCmdlet.ShouldProcess($installDirectory, 'Install Amanatsu AI Chat and bac
         Copy-Item -LiteralPath $source -Destination $target
         if ((Get-FileHash -LiteralPath $source).Hash -ne (Get-FileHash -LiteralPath $target).Hash) { throw "Verification failed: $relative" }
     }
-    # Bundled personality presets never replace a file the user already has.
-    # personalities (Japanese) and personalities-en (English) are kept apart.
-    foreach ($folder in @('personalities', 'personalities-en')) {
+    # Bundled personality and scene presets never replace a file the user already has.
+    # Japanese and English (-en) folders are kept apart.
+    foreach ($folder in @('personalities', 'personalities-en', 'scene-contexts', 'scene-contexts-en')) {
         $presetSource = Join-Path $PSScriptRoot "BepInEx/config/amanatsu.ai-chat/$folder"
         if (!(Test-Path -LiteralPath $presetSource)) { continue }
         $presetTarget = Join-Path $gameDirectory "BepInEx/config/amanatsu.ai-chat/$folder"

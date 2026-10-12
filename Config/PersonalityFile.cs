@@ -10,6 +10,11 @@ internal static class PersonalityFile
         ? "BepInEx/config/amanatsu.ai-chat/personalities-en"
         : "BepInEx/config/amanatsu.ai-chat/personalities");
 
+    // Scene contexts use the same file format but their own folder, so the two lists stay apart.
+    public static string SceneDirectory => Path.GetFullPath(L.En
+        ? "BepInEx/config/amanatsu.ai-chat/scene-contexts-en"
+        : "BepInEx/config/amanatsu.ai-chat/scene-contexts");
+
     public static string Load(string path)
     {
         RequireJsonPath(path);

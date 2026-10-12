@@ -7,8 +7,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 
 # Both editions share the DLL and bridge; they differ in language marker, presets and manual.
 $editions = @(
-    @{ Name = 'AmanatsuAiChat-' + $Version; Language = 'ja'; Presets = 'personalities'; Manual = 'README-JA.md' },
-    @{ Name = 'AmanatsuAiChat-EN-' + $Version; Language = 'en'; Presets = 'personalities-en'; Manual = 'README-EN.md' }
+    @{ Name = 'AmanatsuAiChat-' + $Version; Language = 'ja'; Presets = 'personalities'; Scenes = 'scene-contexts'; Manual = 'README-JA.md' },
+    @{ Name = 'AmanatsuAiChat-EN-' + $Version; Language = 'en'; Presets = 'personalities-en'; Scenes = 'scene-contexts-en'; Manual = 'README-EN.md' }
 )
 foreach ($edition in $editions) {
     $releaseRoot = Join-Path $projectRoot ('dist/' + $edition.Name)
@@ -31,6 +31,9 @@ foreach ($edition in $editions) {
     $presets = Join-Path $releaseRoot ('BepInEx/config/amanatsu.ai-chat/' + $edition.Presets)
     New-Item -ItemType Directory -Path $presets -Force | Out-Null
     Copy-Item -Path (Join-Path $projectRoot ('release/' + $edition.Presets + '/*.json')) -Destination $presets
+    $scenes = Join-Path $releaseRoot ('BepInEx/config/amanatsu.ai-chat/' + $edition.Scenes)
+    New-Item -ItemType Directory -Path $scenes -Force | Out-Null
+    Copy-Item -Path (Join-Path $projectRoot ('release/' + $edition.Scenes + '/*.json')) -Destination $scenes
     Copy-Item -LiteralPath (Join-Path $projectRoot 'README-AI.md') -Destination $releaseRoot
     $manifest = Get-ChildItem -LiteralPath $releaseRoot -File -Recurse | ForEach-Object {
         [PSCustomObject]@{ file=$_.FullName.Substring($releaseRoot.Length+1); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }

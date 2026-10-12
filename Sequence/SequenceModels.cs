@@ -9,6 +9,10 @@ public sealed class SequenceEnvelope
 
     [JsonPropertyName("thinking")]
     public string Thinking { get; set; }
+
+    // The bridge's summary of the model's own choices (speaker, clothing, motion), logged for diagnosis.
+    [JsonPropertyName("decisions")]
+    public string Decisions { get; set; }
 }
 
 public sealed class SequenceCommand
@@ -21,6 +25,10 @@ public sealed class SequenceCommand
 
     [JsonPropertyName("duration")]
     public float? Duration { get; set; }
+
+    // Which character on stage the command is for: 0 main, 1 second; -1 (h_invite only) both.
+    [JsonPropertyName("target")]
+    public int? Target { get; set; }
 }
 
 public static class SequenceValidator

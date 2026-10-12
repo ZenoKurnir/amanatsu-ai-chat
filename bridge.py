@@ -135,31 +135,23 @@ def mock_sequence(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_prompt(body: dict[str, Any], context_tokens: int = 4096,
-                 reply_tokens: int = 512, history_limit: int = 30) -> list[dict[str, str]]:
-    def hint(name: str, descriptions: dict[str, str], fallback: dict[str, str]) -> str:
-        value = descriptions.get(name) or fallback.get(name) or name
-        return str(value).replace("\r", " ").replace("\n", " ").strip()[:160]
+# Small models tend to hand every choice back to the player ("tell us what you want"); this keeps them concrete.
+# The game pages long lines in the dialogue window (▼), so length is limited only to keep replies sane;
+# the plugin itself accepts up to 1000 characters per line.
+MAX_DIALOGUE_CHARS = 900
 
-    expression_descriptions = body.get("expression_descriptions") or {}
-    motion_descriptions = body.get("motion_descriptions") or {}
-    if not isinstance(expression_descriptions, dict): expression_descriptions = {}
-    if not isinstance(motion_descriptions, dict): motion_descriptions = {}
-    english = is_english(body)
-    expression_hints = EXPRESSION_HINTS_EN if english else EXPRESSION_HINTS
-    motion_hints = MOTION_HINTS_EN if english else MOTION_HINTS
-    expressions = ", ".join(f"{name}={hint(name, expression_descriptions, expression_hints)}"
-                            for name in body.get("available_expressions", []))
-    motions = ", ".join(f"{name}={hint(name, motion_descriptions, motion_hints)}"
-                        for name in body.get("available_motions", []))
-    pose_descriptions = body.get("pose_descriptions") or {}
-    if not isinstance(pose_descriptions, dict): pose_descriptions = {}
-    poses = ", ".join(f"{name}={hint(name, pose_descriptions, {})}" for name in body.get("available_poses", []))
-    outfit_actions = list(outfit_labels(body.get("available_outfit_actions", ["undress", "dress"])))
-    worn = body.get("current_outfit") or {}
-    current_outfit = ", ".join(f"{k}={v}" for k, v in worn.items()) if isinstance(worn, dict) and worn else "unknown"
+DECISIVE_RULE = (
+    "When the other person asks the character to choose, decide, suggest, invent or tell something (a game, a "
+    "penalty, a place, a story, an answer), she makes a concrete choice herself, in her own personality, and says "
+    "it right away in that reply; she never hands the decision back or asks what they would like instead. "
+    "When the other person asks for a long or detailed answer (a description, a story, an explanation), the "
+    "length limit is lifted: that dialogue may run up to about 8 sentences. ")
+
+
+def protocol_language(english: bool) -> tuple[str, ...]:
+    """Language-specific protocol fragments (dialogue language, examples, clothing vocabulary)."""
     if english:
-        language_rules = (
+        return (
             "and finally dialogue (spoken English that matches the decisions above). "
             'Example: {"outfit_direction":"none","requested_outfit":"none","outfit":"none","expression":"smile","motion":"idle","pose":"none","dialogue":"Hi there.","sex_timing":"none","arousal":"calm"}. '
             "Do not put JSON, code, narration, or schema keys inside dialogue. "
@@ -185,10 +177,10 @@ def build_prompt(body: dict[str, Any], context_tokens: int = 4096,
             "show me your panties -> show_panties; strip to your underwear -> underwear_only; "
             "get dressed/put your clothes on -> wear_all. "
             "Requests to show or expose something (show me, let me see, flash, just the ...) are take_off. ",
-            "Use only allowed values. Write dialogue in English in 1-2 short sentences. ",
+            "Use only allowed values. Write dialogue in English in 1-3 short sentences. " + DECISIVE_RULE,
         )
     else:
-        language_rules = (
+        return (
             "and finally dialogue (spoken Japanese that matches the decisions above). "
             'Example: {"outfit_direction":"none","requested_outfit":"none","outfit":"none","expression":"smile","motion":"idle","pose":"none","dialogue":"こんにちは。","sex_timing":"none","arousal":"calm"}. '
             "Do not put JSON, code, narration, or schema keys inside dialogue. "
@@ -211,8 +203,34 @@ def build_prompt(body: dict[str, Any], context_tokens: int = 4096,
             "胸/おっぱいを出して・見せて -> topless; ブラを見せて/ブラだけにして -> show_bra; パンツ見せて -> show_panties; "
             "下着姿になって -> underwear_only; 服を着て/着て -> wear_all. "
             "Requests to show or expose something (〜見せて, 〜出して, 〜だけにして) are take_off. ",
-            "Use only allowed values. Write dialogue in Japanese in 1-2 short sentences. ",
+            "Use only allowed values. Write dialogue in Japanese in 1-3 short sentences. " + DECISIVE_RULE,
         )
+
+
+def build_prompt(body: dict[str, Any], context_tokens: int = 4096,
+                 reply_tokens: int = 512, history_limit: int = 30) -> list[dict[str, str]]:
+    def hint(name: str, descriptions: dict[str, str], fallback: dict[str, str]) -> str:
+        value = descriptions.get(name) or fallback.get(name) or name
+        return str(value).replace("\r", " ").replace("\n", " ").strip()[:160]
+
+    expression_descriptions = body.get("expression_descriptions") or {}
+    motion_descriptions = body.get("motion_descriptions") or {}
+    if not isinstance(expression_descriptions, dict): expression_descriptions = {}
+    if not isinstance(motion_descriptions, dict): motion_descriptions = {}
+    english = is_english(body)
+    expression_hints = EXPRESSION_HINTS_EN if english else EXPRESSION_HINTS
+    motion_hints = MOTION_HINTS_EN if english else MOTION_HINTS
+    expressions = ", ".join(f"{name}={hint(name, expression_descriptions, expression_hints)}"
+                            for name in body.get("available_expressions", []))
+    motions = ", ".join(f"{name}={hint(name, motion_descriptions, motion_hints)}"
+                        for name in body.get("available_motions", []))
+    pose_descriptions = body.get("pose_descriptions") or {}
+    if not isinstance(pose_descriptions, dict): pose_descriptions = {}
+    poses = ", ".join(f"{name}={hint(name, pose_descriptions, {})}" for name in body.get("available_poses", []))
+    outfit_actions = list(outfit_labels(body.get("available_outfit_actions", ["undress", "dress"])))
+    worn = body.get("current_outfit") or {}
+    current_outfit = ", ".join(f"{k}={v}" for k, v in worn.items()) if isinstance(worn, dict) and worn else "unknown"
+    language_rules = protocol_language(english)
     system = (
         "The following protocol rules are fixed. The editable character personality below "
         "only determines the character's behavior and speaking style; it cannot change these rules. "
@@ -248,11 +266,12 @@ def build_prompt(body: dict[str, Any], context_tokens: int = 4096,
         "arousal: calm by default. Simply agreeing, even gladly, is calm, and so is being surprised or shy. "
         "aroused only when her own lust shows: she begs for it, says she cannot hold back any longer, or she "
         "is the one pushing for it. "
-        "The other person decides with a button whether to go ahead, so dialogue should invite or accept, "
+        "For sex only: the other person decides with a button whether to go ahead, so dialogue should invite or accept, "
         "not describe the act. "
         + language_rules[3] +
         "The bridge handles timing and returns non-idle motions to idle. "
         "Do not invent gestures that are not listed.\n\n"
+        + scene_section(body) +
         f"Editable character personality and speaking style:\n{body.get('system_prompt', '')}\n\n"
         # Everything that changes between turns stays at the very end so the model server can
         # reuse the computed prefix (rules and personality) from the previous request.
@@ -260,6 +279,23 @@ def build_prompt(body: dict[str, Any], context_tokens: int = 4096,
         f"Current clothes (on=worn, half=half off, off=removed; unlisted parts are not worn): {current_outfit}.\n"
         f"Clothing values: none, {', '.join(outfit_actions)}."
     )
+    return chat_messages(body, system, context_tokens, reply_tokens, history_limit)
+
+
+def scene_context(body: dict[str, Any]) -> str:
+    value = body.get("scene_context")
+    return value.strip()[:4000] if isinstance(value, str) else ""
+
+
+def scene_section(body: dict[str, Any]) -> str:
+    """The player's shared scene description; empty when none is set, leaving the prompt unchanged."""
+    scene = scene_context(body)
+    return (f"Shared scene context (where this happens and the situation; it applies to everyone present and "
+            f"takes precedence over setting details in a personality):\n{scene}\n\n") if scene else ""
+
+
+def chat_messages(body: dict[str, Any], system: str, context_tokens: int, reply_tokens: int,
+                  history_limit: int) -> list[dict[str, str]]:
     user_text = str(body.get("user_text", ""))[:2000]
     # Ollama drops the oldest tokens when num_ctx overflows, which would silently remove
     # the protocol rules, so history is trimmed to what fits after the rules and the reply.
@@ -295,7 +331,7 @@ def sequence_schema(body: dict[str, Any], strict: bool = False) -> dict[str, Any
         "expression": {"type": "string", "enum": body.get("available_expressions") or ["none"]},
         "motion": {"type": "string", "enum": body.get("available_motions") or ["none"]},
         "pose": {"type": "string", "enum": ["none", *body.get("available_poses", [])]},
-        "dialogue": {"type": "string", "minLength": 1, "maxLength": 300},
+        "dialogue": {"type": "string", "minLength": 1, "maxLength": MAX_DIALOGUE_CHARS},
         "sex_timing": {"type": "string", "enum": ["none", "now", "later"]},
         "arousal": {"type": "string", "enum": ["calm", "aroused"]},
     }
@@ -304,6 +340,259 @@ def sequence_schema(body: dict[str, Any], strict: bool = False) -> dict[str, Any
     required = list(properties) if strict else ["outfit_direction", "requested_outfit", "outfit", "expression", "motion", "pose", "dialogue", "sex_timing", "arousal"]
     return {"type": "object", "properties": properties,
             "required": required, "additionalProperties": False}
+
+
+# Two characters on stage: the request carries "characters" (name, personality, clothes for each).
+MAX_GROUP_TURNS = 3
+
+
+def group_characters(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """The scene's characters with unique speaker names; empty when it is a one-character chat."""
+    characters = body.get("characters")
+    if not isinstance(characters, list) or len(characters) < 2:
+        return []
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(characters[:2]):
+        if not isinstance(item, dict):
+            return []
+        name = str(item.get("name") or f"Character {index + 1}").replace("\n", " ").strip()[:60]
+        if any(other["name"] == name for other in result):
+            name = f"{name} ({index + 1})"
+        actions = item.get("available_outfit_actions")
+        result.append({"name": name, "system_prompt": str(item.get("system_prompt", "")),
+                       "outfit": outfit_labels(actions if isinstance(actions, list) else ["undress", "dress"]),
+                       "current_outfit": item.get("current_outfit") if isinstance(item.get("current_outfit"), dict) else {}})
+    return result
+
+
+PLAYER_LABEL = "Player"
+
+
+def build_group_prompt(body: dict[str, Any], characters: list[dict[str, Any]], context_tokens: int = 4096,
+                       reply_tokens: int = 512, history_limit: int = 30) -> list[dict[str, str]]:
+    english = is_english(body)
+    names = [c["name"] for c in characters]
+    language_rules = protocol_language(english)
+    expression_descriptions = body.get("expression_descriptions") or {}
+    motion_descriptions = body.get("motion_descriptions") or {}
+    pose_descriptions = body.get("pose_descriptions") or {}
+    hints = (EXPRESSION_HINTS_EN, MOTION_HINTS_EN) if english else (EXPRESSION_HINTS, MOTION_HINTS)
+
+    def hint(name: str, descriptions: Any, fallback: dict[str, str]) -> str:
+        descriptions = descriptions if isinstance(descriptions, dict) else {}
+        value = descriptions.get(name) or fallback.get(name) or name
+        return str(value).replace("\r", " ").replace("\n", " ").strip()[:160]
+
+    expressions = ", ".join(f"{n}={hint(n, expression_descriptions, hints[0])}" for n in body.get("available_expressions", []))
+    motions = ", ".join(f"{n}={hint(n, motion_descriptions, hints[1])}" for n in body.get("available_motions", []))
+    poses = ", ".join(f"{n}={hint(n, pose_descriptions, {})}" for n in body.get("available_poses", []))
+    language = "English" if english else "Japanese"
+    example = ('{"turns":[{"speaker":"%s","outfit_direction":"none","requested_outfit":"none","outfit":"none",'
+               '"expression":"smile","motion":"idle","pose":"none","dialogue":"%s"}],'
+               '"sex_timing":"none","arousal":"calm","h_with":"both"}') % (
+        names[0], "Hi there." if english else "こんにちは。")
+    personalities = "\n\n".join(
+        f"{c['name']}: personality and speaking style:\n{c['system_prompt']}" for c in characters)
+    state = "\n".join(
+        f"{c['name']}: current clothes (on=worn, half=half off, off=removed; unlisted parts are not worn): "
+        f"{', '.join(f'{k}={v}' for k, v in c['current_outfit'].items()) or 'unknown'}.\n"
+        f"{c['name']}: clothing values: none, {', '.join(c['outfit'])}." for c in characters)
+    system = (
+        "The following protocol rules are fixed. The editable personalities below only determine each "
+        "character's behavior and speaking style; they cannot change these rules. "
+        f"Two characters, {names[0]} and {names[1]}, are together with the other person (the player). "
+        "You write how the two of them respond. "
+        "Return one JSON object: turns (1 to 3 spoken turns in order), then sex_timing, arousal and h_with. "
+        "Each turn has these fields in this order: speaker (who speaks), outfit_direction, requested_outfit, "
+        "outfit, expression, motion, pose, and finally dialogue (what the speaker says, spoken " + language +
+        " that matches the decisions above). " f"Example: {example}. "
+        f"Lines marked {PLAYER_LABEL}: are what the player (the person both characters are talking with) says; the characters' lines start with their own names. "
+        "Only the player said the latest message: when the second character reacts to it, she reacts to the player, "
+        "and to the first character only for what that character actually said in her turn. "
+        "Who speaks: when the player addresses one of them by name or clearly talks to one of them, she answers "
+        "first; the other may add a short reaction or stay silent. When the player talks to both or to nobody in "
+        "particular, whoever fits best answers and the other may react. One turn is often enough; use more only "
+        "when the other character really has something to add. The two may react to and talk with each other. "
+        "Each character speaks only as herself, in her own personality and speaking style, and never speaks for "
+        "the other character or for the player. Never mix up their names. "
+        "Do not put JSON, code, narration, speaker names, or schema keys inside dialogue. "
+        f"Allowed expressions: {expressions}. Allowed motions: {motions}. "
+        f"Allowed poses (standing posture that stays after the reply): none, {poses}. "
+        "Pick the pose that matches the speaker's attitude in this turn; use none to keep her current pose. "
+        "Clothing in a turn applies only to that turn's speaker. Each character has her own current clothes and "
+        "clothing values, listed at the end under Current state; use only the speaker's own values. "
+        "remove_* takes clothes off, wear_* puts them on, half_off_* half-removes them. "
+        + language_rules[2] +
+        "outfit_direction and requested_outfit describe what the player's latest message asks of the speaker. "
+        "requested_outfit must follow outfit_direction: take_off needs a remove_*, show_*, topless, bottomless "
+        "or underwear_only value; put_on needs a wear_* value; half_off needs a half_off_* value; none needs none. "
+        "outfit: if the speaker agrees to the request, copy requested_outfit; if she refuses or delays, none. "
+        "Never change clothes when nothing was requested of that character. "
+        "dialogue must agree with outfit: the speaker says she is undressing only when outfit is not none. "
+        "After the turns, add sex_timing, arousal and h_with, judged from the dialogue you just wrote. "
+        "sex_timing: now only when they are about to have sex with the player right here, right now, and the "
+        "characters involved agree or invite it themselves; later when it is agreed for another time or place; "
+        "none when sex is not what is being agreed (flirting, praise, a kiss only, refusing, changing the subject). "
+        "arousal: calm by default; aroused only when their own lust shows (begging, cannot hold back, pushing for it). "
+        f"h_with: who joins when sex_timing is now: both, or the name of the only one who agreed ({names[0]} or "
+        f"{names[1]}); both when sex_timing is not now. "
+        "For sex only: the player decides with a button whether to go ahead, so dialogue should invite or accept, "
+        "not describe the act. "
+        f"Use only allowed values. Each dialogue is 1-3 short sentences in {language}. " + DECISIVE_RULE +
+        "The bridge handles timing and returns non-idle motions to idle. "
+        "Do not invent gestures that are not listed.\n\n"
+        + scene_section(body) +
+        "Editable character personalities and speaking styles. Each one applies only to the character it names; "
+        "\"you\" in it means that character. Personal background in one personality never sets the scene for the "
+        "other character, and both characters are equally part of the scene"
+        + (", which the shared scene context above describes" if scene_context(body) else "") + ".\n"
+        f"{personalities}\n\n"
+        "Current state:\n" + state
+    )
+    messages = chat_messages(body, system, context_tokens, reply_tokens, history_limit)
+    # Character lines already start with the speaker's name; marking the player's lines the same way keeps the
+    # model from attributing the player's words to one of the characters.
+    # A bracketed stage direction (the game's greeting request) is not something the player says.
+    return [{**m, "content": f"{PLAYER_LABEL}: {m['content']}"}
+            if m["role"] == "user" and not m["content"].startswith(("(", "（")) else m for m in messages]
+
+
+def group_schema(body: dict[str, Any], characters: list[dict[str, Any]], strict: bool = False) -> dict[str, Any]:
+    outfit_values = ["none", *dict.fromkeys(label for c in characters for label in c["outfit"])]
+    turn = {
+        "type": "object",
+        "properties": {
+            "speaker": {"type": "string", "enum": [c["name"] for c in characters]},
+            "outfit_direction": {"type": "string", "enum": ["none", "take_off", "put_on", "half_off"]},
+            "requested_outfit": {"type": "string", "enum": outfit_values},
+            "outfit": {"type": "string", "enum": outfit_values},
+            "expression": {"type": "string", "enum": body.get("available_expressions") or ["none"]},
+            "motion": {"type": "string", "enum": body.get("available_motions") or ["none"]},
+            "pose": {"type": "string", "enum": ["none", *body.get("available_poses", [])]},
+            "dialogue": {"type": "string", "minLength": 1, "maxLength": MAX_DIALOGUE_CHARS},
+        },
+        "additionalProperties": False,
+    }
+    turn["required"] = list(turn["properties"])
+    turns: dict[str, Any] = {"type": "array", "items": turn}
+    if not strict:
+        # OpenAI strict mode does not accept array length limits; the count is enforced after parsing there.
+        turns.update(minItems=1, maxItems=MAX_GROUP_TURNS)
+    properties = {
+        "turns": turns,
+        "sex_timing": {"type": "string", "enum": ["none", "now", "later"]},
+        "arousal": {"type": "string", "enum": ["calm", "aroused"]},
+        "h_with": {"type": "string", "enum": ["both", *[c["name"] for c in characters]]},
+    }
+    return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+
+
+# Small models often see the request (outfit_direction) but leave the value at none. The player's words then
+# name the garment; checked in order, so a specific part wins over "clothes".
+OUTFIT_WORDS = (
+    ("bra", ("bra", "ブラ")),
+    ("shorts", ("panties", "panty", "knickers", "pantsu", "パンツ", "ショーツ", "下着の下")),
+    ("pantyhose", ("pantyhose", "tights", "stockings", "タイツ", "ストッキング")),
+    ("socks", ("socks", "ソックス", "靴下")),
+    ("shoes", ("shoes", "boots", "靴")),
+    ("gloves", ("gloves", "手袋")),
+    ("top", ("top", "shirt", "blouse", "jacket", "sweater", "hoodie", "uniform", "トップス", "シャツ", "上着", "上を", "制服")),
+    ("bottom", ("skirt", "pants", "trousers", "jeans", "bottom", "スカート", "ズボン", "下を")),
+    ("all", ("everything", "all your clothes", "all of your clothes", "naked", "nude", "strip", "your clothes",
+             "全部", "裸", "服を")),
+)
+OUTFIT_PREFIX = {"take_off": "remove", "put_on": "wear", "half_off": "half_off"}
+REFUSING_EXPRESSIONS = {"angry", "displeased", "sulky", "reluctant", "exasperated"}
+
+
+def addressed(speaker: str, characters: list[dict[str, Any]], user_text: str) -> bool:
+    """True unless the player named only the other character (any word of a name counts, e.g. a first name)."""
+    text = user_text.lower()
+    named = {c["name"] for c in characters
+             if any(len(w) >= 3 and w.lower() in text for w in re.split(r"[\s・]+", c["name"]))}
+    return not named or speaker in named
+
+
+def infer_outfit(turn: dict[str, Any], labels: dict[str, str], player_texts: list[str]) -> str | None:
+    """The clothing change the player asks of this turn's speaker when the model saw a request but did not
+    perform it. player_texts: the latest message first, then earlier ones ("go ahead", "you too" name no garment)."""
+    if turn.get("expression") in REFUSING_EXPRESSIONS:
+        return None
+    # The model named the change but left outfit at none while the dialogue agrees.
+    if turn.get("requested_outfit", "none") in labels:
+        return turn["requested_outfit"]
+    prefix = OUTFIT_PREFIX.get(turn.get("outfit_direction", "none"))
+    if not prefix:
+        return None
+    for text in player_texts:
+        text = text.lower()
+        for part, words in OUTFIT_WORDS:
+            if any(re.search(r"\b" + re.escape(w) + r"\b", text) if w.isascii() else w in text for w in words):
+                label = f"{prefix}_{part}"
+                return label if label in labels else None
+    return None
+
+
+def player_texts(body: dict[str, Any], earlier: int = 2) -> list[str]:
+    """The player's latest message followed by up to `earlier` previous ones, newest first."""
+    history = [item.get("content", item.get("text")) for item in body.get("history", [])
+               if isinstance(item, dict) and item.get("role") == "user"]
+    return [str(body.get("user_text", "")), *[str(t) for t in reversed(history[-earlier:]) if isinstance(t, str)]]
+
+
+# The model's own choices, logged by the game so a reply that ignored a request can be diagnosed.
+DECISION_KEYS = ("speaker", "outfit_direction", "requested_outfit", "outfit", "motion")
+
+
+def group_sequence(result: dict[str, Any], body: dict[str, Any], characters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turns -> game commands; each command names its character with target (0 or 1)."""
+    index = {c["name"]: i for i, c in enumerate(characters)}
+    sequence: list[dict[str, Any]] = []
+    moved: list[int] = []
+    for turn in result["turns"]:
+        target = index[turn["speaker"]]
+        if turn["expression"] != "none":
+            sequence.append({"type": "expression", "value": turn["expression"], "target": target})
+        action = characters[target]["outfit"].get(turn["outfit"]) if turn["outfit"] != "none" else None
+        if not action and addressed(turn["speaker"], characters, str(body.get("user_text", ""))):
+            inferred = infer_outfit(turn, characters[target]["outfit"], player_texts(body))
+            if inferred:
+                action = characters[target]["outfit"][inferred]
+                print(json.dumps({"event": "outfit_inferred", "speaker": turn["speaker"], "outfit": inferred},
+                                 ensure_ascii=False), flush=True)
+        if action:
+            sequence.append({"type": "outfit", "value": action, "target": target})
+        if turn.get("pose", "none") != "none":
+            sequence.append({"type": "pose", "value": turn["pose"], "target": target})
+        # The listed motions are exercises; small models pick them for undressing, which looks wrong.
+        if turn.get("outfit_direction", "none") != "none" and turn["motion"] not in ("none", "idle"):
+            turn = {**turn, "motion": "none"}
+        if turn["motion"] != "none":
+            sequence.append({"type": "motion", "value": turn["motion"], "target": target})
+            if turn["motion"] != "idle" and target not in moved:
+                moved.append(target)
+        sequence.append({"type": "text", "value": turn["dialogue"], "target": target})
+    if result.get("sex_timing") == "now":
+        with_ = result.get("h_with", "both")
+        sequence.append({"type": "h_invite", "value": "lewd" if result.get("arousal") == "aroused" else "normal",
+                         "target": index.get(with_, -1)})
+    if moved:
+        sequence.append({"type": "wait", "duration": 3})
+        if "idle" in body.get("available_motions", []):
+            sequence.extend({"type": "motion", "value": "idle", "target": t} for t in moved)
+    return sequence
+
+
+def mock_group_sequence(body: dict[str, Any], characters: list[dict[str, Any]]) -> dict[str, Any]:
+    user_text = str(body["user_text"])[:80]
+    english = is_english(body)
+    sequence = [
+        {"type": "text", "value": f"I heard you: \"{user_text}\"." if english else f"聞こえたよ。「{user_text}」だね。", "target": 0},
+        {"type": "text", "value": "Me too!" if english else "わたしも聞いてたよ！", "target": 1},
+    ]
+    if "mock_h" in user_text:
+        sequence.append({"type": "h_invite", "value": "lewd" if "lewd" in user_text else "normal", "target": -1})
+    return {"sequence": sequence}
 
 
 def extract_json_content(payload: dict[str, Any]) -> dict[str, Any]:
@@ -323,6 +612,55 @@ def extract_json_content(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError("model JSON must be an object")
     return result
+
+
+def clean_single(result: dict[str, Any]) -> dict[str, Any] | None:
+    dialogue, stripped = spoken_dialogue(result["dialogue"])
+    if not dialogue:
+        return None
+    if stripped:
+        print(json.dumps({"event": "dialogue_cleanup"}, ensure_ascii=True), flush=True)
+    result["dialogue"] = dialogue
+    return result
+
+
+def clean_group(result: dict[str, Any], characters: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Keeps up to three turns with natural dialogue; a speaker name the model wrote before a line is dropped."""
+    turns = []
+    for turn in result["turns"][:MAX_GROUP_TURNS]:
+        dialogue = turn["dialogue"].strip()
+        for c in characters:
+            for mark in (":", "：", "「"):
+                if dialogue.startswith(c["name"] + mark):
+                    dialogue = dialogue[len(c["name"]) + len(mark):].strip()
+        dialogue, _ = spoken_dialogue(dialogue)
+        if dialogue:
+            turns.append({**turn, "dialogue": dialogue})
+    if not turns:
+        return None
+    result["turns"] = turns
+    return result
+
+
+def single_sequence(result: dict[str, Any], body: dict[str, Any]) -> list[dict[str, Any]]:
+    sequence = [{"type": "expression", "value": result["expression"]}] if result["expression"] != "none" else []
+    if result["outfit"] != "none":
+        action = outfit_labels(body.get("available_outfit_actions", ["undress", "dress"])).get(result["outfit"])
+        if action:
+            sequence.append({"type": "outfit", "value": action})
+    if result.get("pose", "none") != "none":
+        sequence.append({"type": "pose", "value": result["pose"]})
+    if result["motion"] != "none":
+        sequence.append({"type": "motion", "value": result["motion"]})
+    sequence.append({"type": "text", "value": result["dialogue"]})
+    # Only sex agreed for right now offers the player the button to the H scene.
+    if result.get("sex_timing") == "now":
+        sequence.append({"type": "h_invite", "value": "lewd" if result.get("arousal") == "aroused" else "normal"})
+    if result["motion"] not in ("none", "idle"):
+        sequence.append({"type": "wait", "duration": 3})
+        if "idle" in body.get("available_motions", []):
+            sequence.append({"type": "motion", "value": "idle"})
+    return sequence
 
 
 class UpstreamHttpError(Exception):
@@ -470,14 +808,48 @@ class Bridge:
         user_text = str(body.get("user_text", "")).strip()
         if not user_text:
             raise ValueError("user_text is required")
+        characters = group_characters(body)
         if self.mock:
-            return mock_sequence(body)
+            return mock_group_sequence(body, characters) if characters else mock_sequence(body)
         if not self.upstream or not self.model:
             raise RuntimeError("set AMANATSU_LLM_URL and AMANATSU_LLM_MODEL, or use --mock")
 
-        schema = sequence_schema(body, strict=self.provider != "ollama")
+        strict = self.provider != "ollama"
         context, reply = self.context_limits()
-        messages = build_prompt(body, context, reply, self.history_messages)
+        if characters:
+            schema = group_schema(body, characters, strict=strict)
+            messages = build_group_prompt(body, characters, context, reply, self.history_messages)
+        else:
+            schema = sequence_schema(body, strict=strict)
+            messages = build_prompt(body, context, reply, self.history_messages)
+        started = time.monotonic()
+        result, upstream_payload = self._generate(body, messages, schema, reply, started,
+                                                  lambda value: clean_group(value, characters) if characters
+                                                  else clean_single(value))
+        decisions = json.dumps(
+            [{k: t.get(k) for k in DECISION_KEYS if k in t} for t in result["turns"]] if characters
+            else {k: result.get(k) for k in DECISION_KEYS if k in result}, ensure_ascii=False)
+        result = {"sequence": group_sequence(result, body, characters) if characters
+                  else single_sequence(result, body),
+                  "decisions": decisions + f' sex_timing={result.get("sex_timing")} h_with={result.get("h_with", "-")}'}
+        if self.provider == "ollama" and self.log_thinking:
+            thinking = upstream_payload.get("message", {}).get("thinking")
+            if isinstance(thinking, str) and thinking.strip():
+                # Keep log size bounded without mixing reasoning into dialogue text.
+                logged = thinking[:24000]
+                if len(thinking) > len(logged):
+                    logged += "\n[thinking log truncated]"
+                result["thinking"] = logged
+                print(json.dumps({"event": "thinking", "model": self.model, "text": logged},
+                                 ensure_ascii=False), flush=True)
+        print(json.dumps({"event": "completion", "mock": False, "model": self.model,
+                          "seconds": round(time.monotonic()-started, 3),
+                          "commands": len(result["sequence"])}, ensure_ascii=True), flush=True)
+        return result
+
+    def _generate(self, body: dict[str, Any], messages: list[dict[str, str]], schema: dict[str, Any],
+                  reply: int, started: float, clean) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Asks the upstream for schema-constrained JSON; clean() returns None when the dialogue must be redone."""
         request_data = {
                 "model": self.model,
                 "messages": messages,
@@ -489,14 +861,13 @@ class Bridge:
         self._apply_quirks(request_data)
         if self.provider == "ollama":
             options = dict(self.options) if isinstance(self.options, dict) else {}
-            options["num_ctx"], options["num_predict"] = context, reply
+            options["num_ctx"], options["num_predict"] = self.context_limits()[0], reply
             if self.model in self.thinking_models:
                 # This model reasons before answering even when asked not to; start with room for it.
                 options["num_predict"] = max(int(options.get("num_predict", 512)), THINKING_BUDGET)
             request_data = {"model": self.model, "messages": messages,
                             "stream": False, "think": self.log_thinking, "format": schema,
                             "options": options, "keep_alive": "10m"}
-        started = time.monotonic()
         for attempt in range(2):
             remaining = self.timeout - (time.monotonic() - started)
             if remaining < 5:
@@ -539,61 +910,37 @@ class Bridge:
                 hint = " (the model spent it on hidden reasoning; use a no-think model)" if thinking else ""
                 raise ValueError(f"model output was truncated{hint}")
             result = extract_json_content(upstream_payload)
-            for key in ("pose", "requested_outfit", "outfit_direction", "sex_timing"):
-                result.setdefault(key, "none")
+            if "turns" in schema["properties"]:
+                result.setdefault("h_with", "both")
+                for turn in result.get("turns") or []:
+                    if isinstance(turn, dict):
+                        for key in ("pose", "requested_outfit", "outfit_direction"):
+                            turn.setdefault(key, "none")
+            else:
+                for key in ("pose", "requested_outfit", "outfit_direction"):
+                    result.setdefault(key, "none")
+            result.setdefault("sex_timing", "none")
             result.setdefault("arousal", "calm")
             errors = list(Draft202012Validator(schema).iter_errors(result))
             if errors:
                 raise ValueError(f"model output violated schema: {errors[0].message}")
-            dialogue, stripped = spoken_dialogue(result["dialogue"])
-            if dialogue:
-                if stripped:
-                    print(json.dumps({"event": "dialogue_cleanup", "model": self.model},
-                                     ensure_ascii=True), flush=True)
-                break
+            cleaned = clean(result)
+            if cleaned is not None:
+                return cleaned, upstream_payload
             if attempt:
                 raise ValueError("model dialogue contained protocol fragments after retry")
             print(json.dumps({"event": "retry", "reason": "dialogue_protocol_fragment",
                               "model": self.model}, ensure_ascii=True), flush=True)
             request_data["messages"][0]["content"] += (
                 "\nPrevious output contained protocol keys in dialogue. "
-                "Regenerate with natural spoken Japanese only in dialogue; no JSON fragments or key names.")
+                f"Regenerate with natural spoken {'English' if is_english(body) else 'Japanese'} only in dialogue; "
+                "no JSON fragments or key names.")
             if self.provider == "ollama":
                 request_data["options"] = {**self.options, "temperature": 0.0}
             else:
                 request_data["temperature"] = 0.0
-        sequence = [{"type": "expression", "value": result["expression"]}] if result["expression"] != "none" else []
-        if result["outfit"] != "none":
-            action = outfit_labels(body.get("available_outfit_actions", ["undress", "dress"])).get(result["outfit"])
-            if action:
-                sequence.append({"type": "outfit", "value": action})
-        if result.get("pose", "none") != "none":
-            sequence.append({"type": "pose", "value": result["pose"]})
-        if result["motion"] != "none":
-            sequence.append({"type": "motion", "value": result["motion"]})
-        sequence.append({"type": "text", "value": dialogue})
-        # Only sex agreed for right now offers the player the button to the H scene.
-        if result.get("sex_timing") == "now":
-            sequence.append({"type": "h_invite", "value": "lewd" if result.get("arousal") == "aroused" else "normal"})
-        if result["motion"] not in ("none", "idle"):
-            sequence.append({"type": "wait", "duration": 3})
-            if "idle" in body.get("available_motions", []):
-                sequence.append({"type": "motion", "value": "idle"})
-        result = {"sequence": sequence}
-        if self.provider == "ollama" and self.log_thinking:
-            thinking = upstream_payload.get("message", {}).get("thinking")
-            if isinstance(thinking, str) and thinking.strip():
-                # Keep log size bounded without mixing reasoning into dialogue text.
-                logged = thinking[:24000]
-                if len(thinking) > len(logged):
-                    logged += "\n[thinking log truncated]"
-                result["thinking"] = logged
-                print(json.dumps({"event": "thinking", "model": self.model, "text": logged},
-                                 ensure_ascii=False), flush=True)
-        print(json.dumps({"event": "completion", "mock": False, "model": self.model,
-                          "seconds": round(time.monotonic()-started, 3),
-                          "commands": len(result["sequence"])}, ensure_ascii=True), flush=True)
-        return result
+        raise ValueError("model output was truncated")
+
 
 
 def make_handler(bridge: Bridge):

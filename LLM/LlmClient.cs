@@ -24,6 +24,8 @@ internal sealed class LlmClient : IDisposable
         string userText,
         IReadOnlyList<string> availableOutfitActions,
         IReadOnlyDictionary<string, string> currentOutfit,
+        IReadOnlyList<object> characters,
+        string sceneContext,
         CancellationToken cancellationToken)
     {
         var requestBody = new
@@ -42,7 +44,11 @@ internal sealed class LlmClient : IDisposable
             available_poses = GameAdapter.MotionCatalog.Poses.Select(p => p.Key).ToArray(),
             pose_descriptions = GameAdapter.MotionCatalog.Poses.ToDictionary(p => p.Key, p => p.Description),
             available_outfit_actions = availableOutfitActions,
-            current_outfit = currentOutfit
+            current_outfit = currentOutfit,
+            // Two characters on stage: each one's name, personality and clothes (null for a one-character chat).
+            characters,
+            // The player's shared description of the scene, for everyone present (empty when unset).
+            scene_context = sceneContext ?? ""
         };
         using var request = new HttpRequestMessage(HttpMethod.Post, _endpoint);
         request.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");

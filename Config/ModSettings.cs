@@ -42,6 +42,7 @@ internal sealed class ModSettings
     public readonly ConfigEntry<int> HistoryMessages;
     public readonly ConfigEntry<string> HMaleCard;
     public readonly ConfigEntry<int> HMap;
+    public readonly ConfigEntry<bool> HShareLocation;
 
     public ModSettings(ConfigFile config, BackendSettings backendDefaults)
     {
@@ -80,6 +81,7 @@ internal sealed class ModSettings
         ContextTokens = config.Bind("Bridge", "ContextTokens", backendDefaults.ContextTokens, "Context length in tokens; 0 uses the default (Ollama 4096, OpenAI-compatible 16384). Larger values keep more history but use more GPU memory with Ollama.");
         HistoryMessages = config.Bind("Bridge", "HistoryMessages", backendDefaults.HistoryMessages, "Most recent conversation messages sent to the model (one exchange is two messages), 0 to 200.");
         HMaleCard = config.Bind("HScene", "MaleCard", "", "Male character card used in the H scene; empty for the game's default male. Use the in-game H settings to change it.");
+        HShareLocation = config.Bind("HScene", "ShareLocation", true, "Tell the girls where an H scene took place (the map and the spots used) when they remember it; off for players who imagine their own setting.");
         HMap = config.Bind("HScene", "Map", 0, "Map of the H scene: 0 pool, 1 beach, 2 water cottage, 3 shopping area, 4 waterfall, 5 fountain square, 10 esthetics, 11 rock shade, 12 hotel.");
     }
 

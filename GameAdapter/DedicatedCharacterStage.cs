@@ -17,7 +17,17 @@ internal sealed class DedicatedCharacterStage : IDisposable
     private readonly ManualLogSource _log;
     private readonly ModSettings _settings;
     private ADVCore _core;
-    private Human _human;
+    // Slot 0 is the main character; slot 1 is the optional second character standing beside her.
+    private sealed class Actor
+    {
+        public Human Human;
+        public Animator Animator;
+        public int IdlePose = -1;
+        public int RequestedMotion;
+        public string CardPath;
+    }
+    private readonly Actor[] _actors = { new(), new() };
+    private Human _human { get => _actors[0].Human; set => _actors[0].Human = value; }
     private bool _requested;
     private bool _loaded;
     private bool _ready;
@@ -37,7 +47,7 @@ internal sealed class DedicatedCharacterStage : IDisposable
     private Camera _camera;
     private GameObject _light;
     private Light _oldSun;
-    private Animator _animator;
+    private Animator _animator { get => _actors[0].Animator; set => _actors[0].Animator = value; }
     private string[] _cards = Array.Empty<string>();
     private int _cardIndex;
     private float _distance = 0.75f;
@@ -52,7 +62,7 @@ internal sealed class DedicatedCharacterStage : IDisposable
     private bool _oldCursorVisible;
     private readonly GameObject _uiRoot;
     private string _lastText = "";
-    private int _requestedMotion;
+    private int _requestedMotion { get => _actors[0].RequestedMotion; set => _actors[0].RequestedMotion = value; }
     private bool _eyesFollowCamera = true;
     private bool _neckFollowsCamera;
     private bool _builtInPreset;
@@ -68,6 +78,14 @@ internal sealed class DedicatedCharacterStage : IDisposable
     { _log = log; _uiRoot = uiRoot; _settings = settings; }
     public Human Human => _human;
     public string CharacterName => _human?.Data?.Parameter?.fullname;
+    public Human PartnerHuman => _actors[1].Human;
+    public bool HasPartner => _actors[1].Human != null;
+    public string PartnerName => _actors[1].Human?.Data?.Parameter?.fullname;
+    public string PartnerCardPath => _actors[1].CardPath;
+    public Human HumanAt(int slot) => slot is 0 or 1 ? _actors[slot].Human : null;
+    // Where a character stands now (they can swap places); 0 when she is not on stage.
+    public int SlotOf(Human human) => human != null && _actors[1].Human != null && _actors[1].Human.Pointer == human.Pointer ? 1 : 0;
+    public string NameAt(int slot) => HumanAt(slot)?.Data?.Parameter?.fullname;
     public string ActiveCardPath => _activeCardPath;
     public bool IsReady => _ready && !_failed;
     public bool EyesFollowCamera => _eyesFollowCamera;
@@ -183,28 +201,35 @@ internal sealed class DedicatedCharacterStage : IDisposable
         }
     }
 
-    public bool ShowText(string text)
+    // speaker: the slot whose name the window shows; moreTurns: another character speaks after this,
+    // so the last page keeps ▼ and the reader's next page turn hands over to her (WaitingForNextTurn).
+    public bool ShowText(string text, int speaker = 0, bool moreTurns = false)
     {
         if (!IsReady) return false;
         _pages.Clear();
         _pages.AddRange(Sequence.DialoguePages.Split(text ?? ""));
         _page = 0;
         _lastText = text;
+        _speaker = HumanAt(speaker) != null ? speaker : 0;
+        _moreTurns = moreTurns;
         DisplayPage();
-        _log.LogInfo($"Native ADV text displayed: speaker={CharacterName}, characters={text?.Length ?? 0}, pages={_pages.Count}");
+        _log.LogInfo($"Native ADV text displayed: speaker={NameAt(_speaker)}, characters={text?.Length ?? 0}, pages={_pages.Count}, moreTurns={moreTurns}");
         return true;
     }
 
     // Long replies are split into pages; the window shows one page and ▼ while more follow.
     private readonly List<string> _pages = new();
     private int _page;
-    public bool HasMorePages => _page + 1 < _pages.Count;
+    private int _speaker;
+    private bool _moreTurns;
+    public bool HasMorePages => _page + 1 < _pages.Count || _moreTurns;
+    public bool WaitingForNextTurn => _moreTurns;
 
     public bool NextPage()
     {
         if (!IsReady || !HasMorePages) return false;
-        _page++;
-        DisplayPage();
+        if (_page + 1 < _pages.Count) { _page++; DisplayPage(); }
+        else _moreTurns = false;
         return true;
     }
 
@@ -212,7 +237,7 @@ internal sealed class DedicatedCharacterStage : IDisposable
     {
         _core.Scenario.VisibleWindowForce = true;
         var text = _pages[_page] + (HasMorePages ? " ▼" : "");
-        _core.Scenario.TextController.Set(CharacterName ?? L.T("AI会話", "AI Chat"), text);
+        _core.Scenario.TextController.Set(NameAt(_speaker) ?? CharacterName ?? L.T("AI会話", "AI Chat"), text);
     }
 
     // True when the screen point is on the native dialogue window.
@@ -233,15 +258,18 @@ internal sealed class DedicatedCharacterStage : IDisposable
         _log.LogInfo($"Conversation background selected: {BackgroundBackdrop.Label(spec)}");
     }
 
-    private void SetupCharacter()
+    private void SetupCharacter(int slot = 0)
     {
-        _human.Transform.position = Vector3.zero;
-        _human.Transform.rotation = Quaternion.identity;
-        _human.Body.LoadAnimation("ani/mot/1/000_00.unity3d", "f_00");
-        _animator = _human.Body.animBody;
-        _animator.applyRootMotion = false;
-        _animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
-        PlayMotion(0);
+        var actor = _actors[slot];
+        actor.Human.Transform.position = Vector3.zero;
+        actor.Human.Transform.rotation = Quaternion.identity;
+        actor.Human.Body.LoadAnimation("ani/mot/1/000_00.unity3d", "f_00");
+        actor.Animator = actor.Human.Body.animBody;
+        actor.Animator.applyRootMotion = false;
+        actor.Animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
+        PlayMotion(0, slot);
+        LayoutActors();
+        if (slot != 0) { ApplyGazeMode(); return; }
         var renderers = _human.GameObject.GetComponentsInChildren<SkinnedMeshRenderer>(true);
         var top = 0f;
         foreach (var renderer in renderers)
@@ -254,11 +282,13 @@ internal sealed class DedicatedCharacterStage : IDisposable
             if (bone.name.Equals("cf_J_Head", StringComparison.OrdinalIgnoreCase))
             { if (bone.position.y > 1f) _height = bone.position.y * 1.08f; break; }
         _log.LogInfo($"ADV character height={_height}, modelScale={Character.Human.MODEL_SCALE}");
+        LayoutActors();
         UpdateCamera();
     }
 
-    private int _idlePose = -1;
-    public int IdlePose => _idlePose >= 0 ? _idlePose : _human?.Data?.Parameter?.personality ?? 0;
+    private int _idlePose { get => _actors[0].IdlePose; set => _actors[0].IdlePose = value; }
+    public int IdlePose => IdlePoseAt(0);
+    public int IdlePoseAt(int slot) => _actors[slot].IdlePose >= 0 ? _actors[slot].IdlePose : _actors[slot].Human?.Data?.Parameter?.personality ?? 0;
 
     public int[] AvailableIdlePoses()
     {
@@ -267,27 +297,97 @@ internal sealed class DedicatedCharacterStage : IDisposable
     }
 
     // Changes the standing pose used for idle; returns false if the state is missing.
-    public bool SetIdlePose(int pose, bool play = true)
+    public bool SetIdlePose(int pose, bool play = true, int slot = 0)
     {
-        if (pose >= 0 && _animator != null && !_animator.HasState(0, Animator.StringToHash(MotionCatalog.StateFor(0, pose)))) return false;
-        _idlePose = pose;
-        if (play && _requestedMotion == 0) PlayMotion(0);
+        var actor = _actors[slot];
+        if (pose >= 0 && actor.Animator != null && !actor.Animator.HasState(0, Animator.StringToHash(MotionCatalog.StateFor(0, pose)))) return false;
+        actor.IdlePose = pose;
+        if (play && actor.RequestedMotion == 0) PlayMotion(0, slot);
         return true;
     }
 
-    public bool PlayMotion(int motionIndex)
+    public bool PlayMotion(int motionIndex, int slot = 0)
     {
-        if (_animator?.runtimeAnimatorController == null) return false;
+        var actor = _actors[slot];
+        if (actor.Animator?.runtimeAnimatorController == null) return false;
         // Only verified states from the game's controller may be requested.
-        var state = MotionCatalog.StateFor(motionIndex, _idlePose >= 0 ? _idlePose : _human?.Data?.Parameter?.personality ?? 0);
+        var state = MotionCatalog.StateFor(motionIndex, actor.IdlePose >= 0 ? actor.IdlePose : actor.Human?.Data?.Parameter?.personality ?? 0);
         if (state == null) return false;
         var hash = Animator.StringToHash(state);
-        if (!_animator.HasState(0, hash)) return false;
-        _animator.CrossFadeInFixedTime(hash, 0.15f, 0, 0f);
-        _requestedMotion = motionIndex;
+        if (!actor.Animator.HasState(0, hash)) return false;
+        actor.Animator.CrossFadeInFixedTime(hash, 0.15f, 0, 0f);
+        actor.RequestedMotion = motionIndex;
         if (motionIndex == 0) ApplyGazeMode();
-        _log.LogInfo($"Motion requested: id={motionIndex}, state={state}, hash={hash}");
+        _log.LogInfo($"Motion requested: slot={slot}, id={motionIndex}, state={state}, hash={hash}");
         return true;
+    }
+
+    // Two characters stand side by side, turned slightly toward each other; one stands in the middle.
+    private void LayoutActors()
+    {
+        var pair = HasPartner && _human != null;
+        var offset = _height * .22f;
+        for (var slot = 0; slot < _actors.Length; slot++)
+        {
+            var human = _actors[slot].Human;
+            if (human == null) continue;
+            var side = pair ? (slot == 0 ? -1f : 1f) : 0f;
+            human.Transform.position = new Vector3(side * offset, 0f, 0f);
+            human.Transform.rotation = Quaternion.Euler(0f, -side * 10f + _turn, 0f);
+        }
+    }
+
+    public bool SetPartner(string path)
+    {
+        if (!IsReady) throw new InvalidOperationException("Conversation stage is not ready.");
+        var fullPath = Path.GetFullPath(path);
+        if (!string.Equals(Path.GetExtension(fullPath), ".png", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Character card must be a PNG file.");
+        if (!File.Exists(fullPath)) throw new FileNotFoundException("Character card not found.", fullPath);
+        var data = new HumanData((byte)1);
+        if (!data.LoadCharaFile(fullPath)) throw new InvalidDataException("Character card load failed.");
+        var replacement = Character.Human.Create(data) ?? throw new InvalidDataException("Character could not be created from card.");
+        var previous = _actors[1].Human;
+        _actors[1].Human = replacement;
+        _actors[1].IdlePose = -1;
+        try { SetupCharacter(1); }
+        catch
+        {
+            _actors[1].Human = previous;
+            _actors[1].Animator = previous?.Body?.animBody;
+            replacement.Dispose();
+            LayoutActors();
+            throw;
+        }
+        _actors[1].CardPath = fullPath;
+        previous?.Dispose();
+        UpdateCamera();
+        _log.LogInfo($"ADV second character added: {fullPath}");
+        return true;
+    }
+
+    public void RemovePartner()
+    {
+        var human = _actors[1].Human;
+        if (human == null) return;
+        _actors[1] = new Actor();
+        try { human.Dispose(); } catch (Exception ex) { _log.LogWarning($"Second character dispose failed: {ex.Message}"); }
+        if (_speaker == 1) _speaker = 0;
+        LayoutActors();
+        UpdateCamera();
+        _log.LogInfo("ADV second character removed.");
+    }
+
+    // The two characters change places, so the main slot (personality editor, pose, H lead) is the other one.
+    public void SwapPartner()
+    {
+        if (!HasPartner || _human == null) return;
+        (_actors[0], _actors[1]) = (_actors[1], _actors[0]);
+        (_activeCardPath, _actors[1].CardPath) = (_actors[0].CardPath, _activeCardPath);
+        _speaker = 1 - _speaker;
+        LayoutActors();
+        ApplyGazeMode();
+        _log.LogInfo($"ADV characters swapped: main={_activeCardPath}");
     }
 
     public int Coordinate => _human == null ? -1 : (int)_human.FileStatus.coordinateType;
@@ -300,6 +400,7 @@ internal sealed class DedicatedCharacterStage : IDisposable
         var next = Coordinate == 0 ? HumanCoordinate.Define.CoordinateType.AfterBath : HumanCoordinate.Define.CoordinateType.Swimsuit;
         if (!_human.Coorde.ChangeCoordinateTypeAndReload(next, true)) return false;
         PlayMotion(0);
+        if (HasPartner && _actors[1].Human.Coorde.ChangeCoordinateTypeAndReload(next, true)) PlayMotion(0, 1);
         ApplyGazeMode();
         _log.LogInfo($"Conversation coordinate switched to {next}.");
         return true;
@@ -321,10 +422,15 @@ internal sealed class DedicatedCharacterStage : IDisposable
 
     private void ApplyGazeMode()
     {
-        if (_camera == null || _human?.Face == null) return;
+        foreach (var actor in _actors) ApplyGazeMode(actor.Human);
+    }
+
+    private void ApplyGazeMode(Human human)
+    {
+        if (_camera == null || human?.Face == null) return;
         try
         {
-            var face = _human.Face;
+            var face = human.Face;
             var eyes = face.eyeLookCtrl;
             var neck = face.neckLookCtrl;
             var eyePattern = -1;
@@ -450,9 +556,12 @@ internal sealed class DedicatedCharacterStage : IDisposable
         _log.LogInfo($"ADV character selected: {fullPath}");
     }
 
+    private float _turn;
+
     public void Rotate(float degrees)
     {
-        if (_human != null) _human.Transform.Rotate(0f, degrees, 0f);
+        _turn = Mathf.Repeat(_turn + degrees + 180f, 360f) - 180f;
+        LayoutActors();
     }
 
     public void Zoom(float steps)
@@ -602,7 +711,8 @@ internal sealed class DedicatedCharacterStage : IDisposable
     {
         if (_camera == null) return;
         var target = new Vector3(0f, _height * _targetHeight, 0f) + _pan;
-        var position = target + Quaternion.Euler(-_pitch, _yaw, 0f) * new Vector3(0f, 0f, _height * _distance);
+        var width = HasPartner && _human != null ? 1.35f : 1f;
+        var position = target + Quaternion.Euler(-_pitch, _yaw, 0f) * new Vector3(0f, 0f, _height * _distance * width);
         var rotation = Quaternion.LookRotation(target - position);
         var smoothing = Mathf.Clamp(_settings.CameraSmoothing.Value, 0f, .5f);
         var t = snap || !_cameraInitialized || smoothing <= 0f ? 1f : 1f - Mathf.Exp(-Time.unscaledDeltaTime / smoothing);
@@ -619,7 +729,7 @@ internal sealed class DedicatedCharacterStage : IDisposable
     {
         if (!IsReady || Suspended) return;
         Suspended = true;
-        if (_human != null) _human.GameObject.SetActive(false);
+        foreach (var actor in _actors) actor.Human?.GameObject.SetActive(false);
         if (_camera != null) _camera.enabled = false;
         if (_light != null) { RenderSettings.sun = _oldSun; _light.SetActive(false); }
         if (_nativeCanvasGroup != null) { _nativeCanvasGroup.alpha = 0f; _nativeCanvasGroup.blocksRaycasts = false; _nativeCanvasGroup.interactable = false; }
@@ -640,11 +750,12 @@ internal sealed class DedicatedCharacterStage : IDisposable
         if (_core != null) Manager.Scene.Add(new Manager.Scene.IOverlap(_core.Pointer));
         AiChatBehaviour.Graphics.Enter();
         _postProcessing.SetActive(true);
-        if (_human != null) _human.GameObject.SetActive(true);
+        foreach (var actor in _actors) actor.Human?.GameObject.SetActive(true);
         if (_camera != null) _camera.enabled = true;
         if (_light != null) { _light.SetActive(true); RenderSettings.sun = _light.GetComponent<Light>(); }
         if (_nativeCanvasGroup != null) { _nativeCanvasGroup.alpha = 1f; _nativeCanvasGroup.blocksRaycasts = true; _nativeCanvasGroup.interactable = true; }
         PlayMotion(_requestedMotion);
+        if (HasPartner) PlayMotion(_actors[1].RequestedMotion, 1);
         RefreshGraphics();
     }
 
@@ -683,6 +794,11 @@ internal sealed class DedicatedCharacterStage : IDisposable
         _ready = false;
         _activeCardPath = null;
         if (_human != null) { _human.Dispose(); _human = null; }
+        if (_actors[1].Human != null) try { _actors[1].Human.Dispose(); } catch (Exception ex) { _log.LogWarning($"Second character dispose failed: {ex.Message}"); }
+        _actors[0] = new Actor();
+        _actors[1] = new Actor();
+        _turn = 0f;
+        _moreTurns = false;
         if (_light != null) { RenderSettings.sun = _oldSun; UnityEngine.Object.Destroy(_light); _light = null; }
         foreach (var state in _titleGroups)
         {

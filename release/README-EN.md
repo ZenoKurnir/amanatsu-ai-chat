@@ -79,7 +79,9 @@ Reply speed depends heavily on the model size and your PC. Without a GPU, a repl
 | Background "Prev" / "Next" / "Choose image…" | Uses a plain color, a background bundled with the game, or your own PNG/JPEG. Your image is not copied into the mod. |
 | "－" at the top right / "Menu" at the top left / H | Hides or shows the control panel. |
 | "Exit" | Ends the conversation and returns to the normal title screen. |
-| "Go to H" | Appears next to "Send" only when the character invites you to sex or agrees to it. Press it to move to the game's own H scene. It disappears when you send your next message. |
+| "Add 2nd…" / "Swap" / "Remove" | "Add 2nd…" picks a second female card so two girls share the stage and both talk with you. "Swap" exchanges their places; "Remove" goes back to one girl. The second girl is remembered for next time. |
+| "Context…" | Edits the shared scene (where you are, the situation) and each girl's personality. See section 5. |
+| "Go to H" | Appears next to "Send" only when the character invites you to sex or agrees to it. Press it to move to the game's own H scene. It disappears when you send your next message. With two girls on stage, it is replaced by "H with (name)" for each girl, "H with both" and "Watch the girls". |
 | Click the dialogue window / Space / PageDown | Long replies are split into pages; "▼" at the end means more follows. Click the dialogue window, or press Space or PageDown, to show the next page. The keys work only while no text box has the cursor. |
 
 Keys can be changed in the config file. Shortcuts such as 1, 2, H and Ctrl do not work while a text box has the cursor. F10 also opens and closes the chat screen.
@@ -111,6 +113,8 @@ Press "Go to H" to start the game's own H scene with the character you are talki
 - Positions and places can be changed inside the H scene. Every position is available regardless of progress in the main game.
 - The character in the H scene starts in the outfit saved on her card; clothes can be taken off inside the H scene.
 - The conversation memory and the chat screen's outfit continue after you come back.
+- With two girls on stage you choose who comes: one of them, both (the game's threesome positions with 1 male and 2 females become available), or "Watch the girls", where the two girls play the game's girl-girl positions and you only watch.
+- When you come back, the girls remember what happened and react to it. The mod follows the H scene and tells them, per girl, which positions were played (kissing, caressing, oral, doggy style, anal and so on), how often each girl climaxed and during what, climaxing together, where the male came (inside, in her mouth, on her face or body, bukkake), swallowing or spitting, and whether she ended up exhausted. A girl who did not take part is told she watched. When both girls are in a threesome position, the game does not say which one climaxed, so that is told as "one of them". The last three H scenes are remembered until you switch characters.
 
 Choose the map and the male character with "H scene…" in "Connection".
 
@@ -118,6 +122,7 @@ Choose the map and the male character with "H scene…" in "Connection".
 | --- | --- |
 | Male character card | "Open card…" picks a PNG card, for example from `UserData/chara/male`. "Default male" returns to the game's own protagonist. |
 | Map | "◀" / "▶" choose from pool, beach, water cottage, shopping area, waterfall, fountain square, esthetics, rock shade and hotel. |
+| Remember location | ON tells the girls where the H scene took place (the map, and spots such as a beach lounger or in the pool). OFF leaves every place out, for players who imagine their own setting. |
 
 The choices are saved under `[HScene]` in the config file.
 
@@ -127,9 +132,12 @@ The conversation is remembered only while the game is running. If you close the 
 
 ## 5. Personality, expressions and connection
 
-"Personality…" edits how the character talks, her personality and how she treats you. "Apply to card" saves it to the mod's own settings for that card; the card PNG itself is never modified. "Save as…" saves just the personality to a separate file, and "Open file…" loads one; after loading, press "Apply to card". Output format and motion control cannot be changed here.
+"Context…" has a tab for the shared scene and one per girl on stage.
 
-The ZIP includes ten English personality presets: caretaker, tomboy, graceful, ojousama, diligent, gal, big sis, devoted, quiet and tsundere. The installer copies them to `BepInEx/config/amanatsu.ai-chat/personalities-en`; pick one with "Open file…" and press "Apply to card". Files with the same name are never overwritten. The English edition keeps its own folders, so Japanese presets never appear in the list.
+- **Scene (everyone)**: where you are, the situation and how everyone knows each other. It applies to every girl and may be empty. The default is a summer vacation on a southern island. "Apply" saves it; "Save as…" / "Open file…" use `BepInEx/config/amanatsu.ai-chat/scene-contexts-en`, which comes with `island.json` (the default scene).
+- **Each girl's tab**: how she talks, her personality and how she treats you. "Apply" saves it to the mod's own settings for that card; the card PNG itself is never modified. "Save as…" saves just the personality to a separate file, and "Open file…" loads one; after loading, press "Apply". Output format and motion control cannot be changed here.
+
+The ZIP includes ten English personality presets: caretaker, tomboy, graceful, ojousama, diligent, gal, big sis, devoted, quiet and tsundere. The installer copies them to `BepInEx/config/amanatsu.ai-chat/personalities-en`; pick one with "Open file…" and press "Apply". Files with the same name are never overwritten. The English edition keeps its own folders, so Japanese presets never appear in the list.
 
 ### Creating, editing and deleting expression presets
 

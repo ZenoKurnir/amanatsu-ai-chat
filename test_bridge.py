@@ -307,5 +307,174 @@ class HInviteTests(unittest.TestCase):
         self.assertIn({"type": "h_invite", "value": "lewd"}, sequence)
 
 
+class GroupTests(unittest.TestCase):
+    """Two characters on stage share one reply made of speaker turns."""
+
+    def test_group_prompt_marks_player_lines(self):
+        chars = bridge.group_characters({"characters": [{"name": "Ann"}, {"name": "Bea"}]})
+        body = {"user_text": "Ann, hello", "language": "en", "available_expressions": ["smile"],
+                "available_motions": ["idle"], "history": [{"role": "user", "text": "hi"},
+                                                           {"role": "assistant", "text": "Ann: Hi.\nBea: Hey."}]}
+        messages = bridge.build_group_prompt(body, chars)
+        self.assertEqual([m["content"] for m in messages[1:]], ["Player: hi", "Ann: Hi.\nBea: Hey.", "Player: Ann, hello"])
+        body["user_text"] = "(The conversation has just started.)"
+        self.assertEqual(bridge.build_group_prompt(body, chars)[-1]["content"], "(The conversation has just started.)")
+
+    def test_scene_context_is_shared_and_only_present_when_set(self):
+        chars = bridge.group_characters({"characters": [{"name": "Ann", "system_prompt": "You are Ann."},
+                                                        {"name": "Bea", "system_prompt": "You are Bea."}]})
+        body = {"user_text": "hi", "language": "en", "available_expressions": ["smile"], "available_motions": ["idle"]}
+        self.assertNotIn("Shared scene context", bridge.build_group_prompt(body, chars)[0]["content"])
+        self.assertNotIn("Shared scene context", bridge.build_prompt(body)[0]["content"])
+        body["scene_context"] = "  A beach at night.  "
+        for system in (bridge.build_group_prompt(body, chars)[0]["content"], bridge.build_prompt(body)[0]["content"]):
+            self.assertIn("Shared scene context", system)
+            self.assertIn("A beach at night.\n", system)
+        group = bridge.build_group_prompt(body, chars)[0]["content"]
+        self.assertLess(group.index("A beach at night."), group.index("You are Ann."))
+
+    def test_group_outfit_inferred_from_player_words_when_model_names_none(self):
+        chars = [{"name": "Mizuno Aoi", "outfit": bridge.outfit_labels(["top:undress", "bra:undress", "undress"])},
+                 {"name": "Kato Rin", "outfit": bridge.outfit_labels(["top:undress", "undress"])}]
+        def turn(speaker, direction="take_off", expression="smile"):
+            return {"speaker": speaker, "outfit_direction": direction, "requested_outfit": "none", "outfit": "none",
+                    "expression": expression, "motion": "idle", "pose": "none", "dialogue": "Okay."}
+        def outfits(turns, text):
+            seq = bridge.group_sequence({"turns": turns, "sex_timing": "none"}, {"user_text": text}, chars)
+            return [(c["target"], c["value"]) for c in seq if c["type"] == "outfit"]
+        self.assertEqual(outfits([turn("Mizuno Aoi")], "Aoi, take off your top"), [(0, "top:undress")])
+        self.assertEqual(outfits([turn("Mizuno Aoi")], "Aoi, take off your bra"), [(0, "bra:undress")])
+        # Only the girl the player named changes; a refusal or no request changes nothing.
+        self.assertEqual(outfits([turn("Kato Rin")], "Aoi, take off your top"), [])
+        self.assertEqual(outfits([turn("Mizuno Aoi", expression="angry")], "Aoi, take off your top"), [])
+        self.assertEqual(outfits([turn("Mizuno Aoi", direction="none")], "Aoi, take off your top"), [])
+        self.assertEqual(outfits([turn("Kato Rin")], "take off your clothes"), [(1, "undress")])
+        # A follow-up that names no garment takes it from the player's earlier message.
+        seq = bridge.group_sequence({"turns": [turn("Kato Rin")], "sex_timing": "none"},
+                                    {"user_text": "now you Rin",
+                                     "history": [{"role": "user", "text": "Aoi, take off your top"}]}, chars)
+        self.assertIn({"type": "outfit", "value": "top:undress", "target": 1}, seq)
+        # The model named the change but did not perform it while agreeing.
+        agreed = {**turn("Kato Rin"), "requested_outfit": "remove_all"}
+        self.assertEqual(outfits([agreed], "take it all off Rin"), [(1, "undress")])
+
+    def test_group_complete_outfit_goes_to_speaker_and_decisions_are_reported(self):
+        turn = {"speaker": "Bea", "outfit_direction": "take_off", "requested_outfit": "remove_all",
+                "outfit": "remove_all", "expression": "smile", "motion": "idle", "pose": "none", "dialogue": "Okay."}
+        response = MagicMock()
+        response.read.return_value = json.dumps({"message": {"content": json.dumps(
+            {"turns": [turn], "sex_timing": "none", "arousal": "calm", "h_with": "both"})}}).encode("utf-8")
+        context = MagicMock()
+        context.__enter__.return_value = response
+        body = {"user_text": "Bea, undress", "language": "en", "available_expressions": ["smile"],
+                "available_motions": ["idle"],
+                "characters": [{"name": "Ann", "available_outfit_actions": ["undress", "dress"]},
+                               {"name": "Bea", "available_outfit_actions": ["undress", "dress"]}]}
+        with patch("bridge.urllib.request.urlopen", return_value=context):
+            result = bridge.Bridge(False, settings={"provider": "ollama", "url": "http://localhost:11434/api/chat",
+                                                    "model": "test"}).complete(body)
+        self.assertIn({"type": "outfit", "value": "undress", "target": 1}, result["sequence"])
+        self.assertIn('"requested_outfit": "remove_all"', result["decisions"])
+
+    BODY = {
+        "user_text": "Aoi, take off your top", "language": "en",
+        "available_expressions": ["smile", "neutral"], "available_motions": ["idle", "stretch"],
+        "available_poses": ["pose_hands_on_hips"],
+        "characters": [
+            {"name": "Aoi", "system_prompt": "Cheerful.", "available_outfit_actions": ["top:undress", "undress"],
+             "current_outfit": {"top": "on(T-shirt)"}},
+            {"name": "Mei", "system_prompt": "Shy.", "available_outfit_actions": ["dress"],
+             "current_outfit": {"top": "off(Blouse)"}},
+        ],
+    }
+
+    def reply(self, turns, sex_timing="none", h_with="both", arousal="calm", provider="ollama"):
+        payload = {"turns": turns, "sex_timing": sex_timing, "arousal": arousal, "h_with": h_with}
+        response = MagicMock()
+        response.read.return_value = json.dumps({"message": {"content": json.dumps(payload)}}).encode("utf-8")
+        context = MagicMock()
+        context.__enter__.return_value = response
+        with patch("bridge.urllib.request.urlopen", return_value=context) as open_url:
+            client = bridge.Bridge(False, settings={"provider": provider, "url": "http://localhost:11434/api/chat", "model": "m"})
+            result = client.complete(dict(self.BODY))
+            return result["sequence"], json.loads(open_url.call_args.args[0].data)
+
+    @staticmethod
+    def turn(speaker, dialogue, outfit="none", motion="idle", expression="smile"):
+        return {"speaker": speaker, "outfit_direction": "none", "requested_outfit": "none", "outfit": outfit,
+                "expression": expression, "motion": motion, "pose": "none", "dialogue": dialogue}
+
+    def test_one_character_requests_are_unchanged(self):
+        body = {key: value for key, value in self.BODY.items() if key != "characters"}
+        self.assertEqual(bridge.build_prompt(body), bridge.build_prompt({**body, "characters": [self.BODY["characters"][0]]}))
+        self.assertNotIn("turns", bridge.sequence_schema(body)["properties"])
+
+    def test_prompt_names_both_characters_with_their_own_state(self):
+        system = bridge.build_group_prompt(self.BODY, bridge.group_characters(self.BODY))[0]["content"]
+        for text in ("Aoi", "Mei", "Cheerful.", "Shy.", "on(T-shirt)", "off(Blouse)", "remove_top", "wear_all"):
+            self.assertIn(text, system)
+        self.assertIsNone(re.search(r"[\u3040-\u30ff]", system))
+
+    def test_schema_limits_speakers_and_values(self):
+        characters = bridge.group_characters(self.BODY)
+        schema = bridge.group_schema(self.BODY, characters)
+        turn = schema["properties"]["turns"]["items"]["properties"]
+        self.assertEqual(turn["speaker"]["enum"], ["Aoi", "Mei"])
+        self.assertEqual(schema["properties"]["h_with"]["enum"], ["both", "Aoi", "Mei"])
+        self.assertEqual(schema["properties"]["turns"]["maxItems"], 3)
+        self.assertNotIn("maxItems", bridge.group_schema(self.BODY, characters, strict=True)["properties"]["turns"])
+
+    def test_turns_become_targeted_commands_in_order(self):
+        sequence, request = self.reply([self.turn("Aoi", "Sure!", outfit="remove_top", motion="stretch"),
+                                        self.turn("Mei", "Aoi, really?")])
+        self.assertEqual(request["format"]["properties"]["turns"]["items"]["properties"]["speaker"]["enum"], ["Aoi", "Mei"])
+        texts = [(c["value"], c["target"]) for c in sequence if c["type"] == "text"]
+        self.assertEqual(texts, [("Sure!", 0), ("Aoi, really?", 1)])
+        self.assertIn({"type": "outfit", "value": "top:undress", "target": 0}, sequence)
+        self.assertEqual(sequence[-1], {"type": "motion", "value": "idle", "target": 0})
+
+    def test_outfit_value_of_the_other_character_is_ignored(self):
+        sequence, _ = self.reply([self.turn("Mei", "Okay.", outfit="remove_top")])
+        self.assertFalse([c for c in sequence if c["type"] == "outfit"])
+
+    def test_speaker_name_written_into_dialogue_is_removed(self):
+        sequence, _ = self.reply([self.turn("Aoi", "Aoi: Hello!")])
+        self.assertIn({"type": "text", "value": "Hello!", "target": 0}, sequence)
+
+    def test_h_invite_names_who_joins(self):
+        both, _ = self.reply([self.turn("Aoi", "Let's.")], sex_timing="now")
+        one, _ = self.reply([self.turn("Mei", "Only me.")], sex_timing="now", h_with="Mei", arousal="aroused")
+        later, _ = self.reply([self.turn("Mei", "Tonight.")], sex_timing="later")
+        self.assertIn({"type": "h_invite", "value": "normal", "target": -1}, both)
+        self.assertIn({"type": "h_invite", "value": "lewd", "target": 1}, one)
+        self.assertFalse([c for c in later if c["type"] == "h_invite"])
+
+    def test_same_names_are_told_apart(self):
+        body = {**self.BODY, "characters": [{"name": "Aoi"}, {"name": "Aoi"}]}
+        self.assertEqual([c["name"] for c in bridge.group_characters(body)], ["Aoi", "Aoi (2)"])
+
+    def test_mock_group_reply_uses_both_characters(self):
+        sequence = bridge.Bridge(True).complete(dict(self.BODY, user_text="mock_h"))["sequence"]
+        self.assertEqual({c["target"] for c in sequence if c["type"] == "text"}, {0, 1})
+        self.assertIn({"type": "h_invite", "value": "normal", "target": -1}, sequence)
+
+    def test_english_retry_asks_for_english(self):
+        bad = self.turn("Aoi", "expression:")
+        good = self.turn("Aoi", "Hi.")
+        contexts = []
+        for turns in ([bad], [good]):
+            response = MagicMock()
+            response.read.return_value = json.dumps({"message": {"content": json.dumps(
+                {"turns": turns, "sex_timing": "none", "arousal": "calm", "h_with": "both"})}}).encode("utf-8")
+            manager = MagicMock()
+            manager.__enter__.return_value = response
+            contexts.append(manager)
+        with patch("bridge.urllib.request.urlopen", side_effect=contexts) as open_url:
+            client = bridge.Bridge(False, settings={"provider": "ollama", "url": "http://localhost:11434/api/chat", "model": "m"})
+            client.complete(dict(self.BODY))
+            retry = json.loads(open_url.call_args.args[0].data)["messages"][0]["content"]
+        self.assertIn("natural spoken English", retry)
+
+
 if __name__ == "__main__":
     unittest.main()

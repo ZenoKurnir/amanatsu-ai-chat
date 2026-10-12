@@ -55,6 +55,7 @@ public sealed class Plugin : BasePlugin
             AiChatBehaviour.CharacterConfigPath = "BepInEx/config/amanatsu.ai-chat/default-en.json";
         AiChatBehaviour.CardPathConfig = Config.Bind("Character", "CardPath", "", "Last selected female character card. Empty opens the file picker when chat is opened.");
         AiChatBehaviour.CharacterCardPath = AiChatBehaviour.CardPathConfig.Value;
+        AiChatBehaviour.PartnerCardPathConfig = Config.Bind("Character", "PartnerCardPath", "", "Second female character card on the chat stage; empty for a one-character chat. Use the panel's 2nd girl buttons to change it.");
         AiChatBehaviour.OpenOnStartup = Config.Bind("UI", "OpenOnStartup", false, "Open the dedicated chat UI immediately, including on the title screen. Normally leave this disabled and use the configured OpenChat key.").Value;
         AiChatBehaviour.DiagnosticsEnabled = Config.Bind("Testing", "DiagnosticsEnabled", false, "Opt-in local file test commands and state readback. No network listener.").Value;
         if (AiChatBehaviour.DiagnosticsEnabled)
@@ -81,6 +82,7 @@ public sealed class AiChatBehaviour : MonoBehaviour
     internal static ConfigEntry<string> EndpointConfig;
     internal static ConfigEntry<string> TokenConfig;
     internal static ConfigEntry<string> CardPathConfig;
+    internal static ConfigEntry<string> PartnerCardPathConfig;
     internal static string BackendSettingsPath = "";
     internal static string CharacterConfigPath = "";
     internal static string CharacterCardPath = "";
@@ -95,6 +97,11 @@ public sealed class AiChatBehaviour : MonoBehaviour
     private Dictionary<string, ExpressionPreset> _globalExpressions;
     private string _profileCardPath;
     private CharacterAdapter _adapter;
+    // The optional second character on stage (slot 1) and her own per-card profile.
+    private CharacterConfig _partnerCharacter;
+    private string _sceneContext = "";
+    private CharacterAdapter _partnerAdapter;
+    private bool _partnerRestorePending;
     private SequenceRunner _runner;
     private LlmClient _client;
     private CancellationTokenSource _requestCancellation;
@@ -108,9 +115,16 @@ public sealed class AiChatBehaviour : MonoBehaviour
     private DedicatedCharacterStage _stage;
     private HTransition _h;
     private string _hInvite;
+    private int _hInviteWith;
     private int _requestGeneration;
     private bool _greetingPending;
+    // What happened in earlier H scenes with the girls now on stage, oldest first; they react to the newest on return.
+    private readonly List<string> _hMemories = new();
+    private bool _aftermathPending;
     private bool _greetingInFlight;
+    private static string GroupGreetingInstruction => L.T(
+        "（会話が始まりました。二人とも、キャラクターらしく自然に相手へ最初のひと言をかけてください。一人だけでも二人でも構いません。候補を並べたり、かぎかっこで区切ったりしないでください。）",
+        "(The conversation has just started. Greet the other person naturally, in character; one or both of you may speak. Do not list options or wrap lines in quotation marks.)");
     private static string GreetingInstruction => L.T(
         "（会話が始まりました。あなたから相手に、キャラクターらしい自然な最初のひと言を一つだけ話しかけてください。候補を並べたり、かぎかっこで区切ったりしないでください。）",
         "(The conversation has just started. Say one natural opening line to the other person, in character. Do not list options or wrap the line in quotation marks.)");
@@ -151,6 +165,8 @@ public sealed class AiChatBehaviour : MonoBehaviour
                 LoadBackendSettings, SaveBackendSettings, TestBackendConnection, RestartBridge, () => _stage?.Rotate(-15f), () => _stage?.Rotate(15f),
                 () => _stage?.Zoom(-1f), () => _stage?.Zoom(1f), AdjustFace,
                 () => _stage?.ToggleEyeLookMode(), () => _stage?.ToggleNeckLookMode(), SwitchCoordinate, CyclePose, Settings);
+            _ui.ConfigureContextEditor(ContextName, ContextText, ApplyContext);
+            _sceneContext = LoadSceneContext();
             _stage = new DedicatedCharacterStage(_ui.Root, LogSource!, Settings);
             _h = new HTransition(LogSource!);
             _titleEntry = new TitleEntryUi(_ui.Font, () => SetVisible(true));
@@ -159,7 +175,7 @@ public sealed class AiChatBehaviour : MonoBehaviour
                 () => L.T("影: ", "Shadow: ") + Graphics.ShadowType.Value,
                 CycleBackground, ChooseBackgroundImage, () => BackgroundBackdrop.Label(Settings.BackgroundImage.Value));
             _ui.AddModelPicker(RequestModelList);
-            _ui.AddHInvite(AcceptHInvite);
+            _ui.AddHInvite(with => AcceptHInvite(with, false), () => AcceptHInvite(-1, true));
             _ui.AddHSettings(
                 () => string.IsNullOrWhiteSpace(Settings.HMaleCard.Value) ? L.T("既定の男性", "Default male") : Path.GetFileName(Settings.HMaleCard.Value),
                 () => { var card = NativeFilePicker.ChooseMaleCard(Settings.HMaleCard.Value); if (card != null) Settings.HMaleCard.Value = card; },
@@ -169,7 +185,11 @@ public sealed class AiChatBehaviour : MonoBehaviour
                 {
                     var i = Array.IndexOf(HTransition.Maps, Settings.HMap.Value);
                     Settings.HMap.Value = HTransition.Maps[((i < 0 ? 0 : i) + step + HTransition.Maps.Length) % HTransition.Maps.Length];
-                });
+                },
+                () => Settings.HShareLocation.Value
+                    ? L.T("場所の記憶: ON（マップと場所）", "Remember location: ON (map and spots)")
+                    : L.T("場所の記憶: OFF", "Remember location: OFF"),
+                () => Settings.HShareLocation.Value = !Settings.HShareLocation.Value);
             _ui.AddLightControls(
                 () => (Settings.LightVertical.Value, Settings.LightHorizontal.Value, Settings.LightIntensity.Value,
                     ColorUtility.TryParseHtmlString(Settings.LightColor.Value, out var lightColor) ? lightColor : Color.white),
@@ -177,8 +197,9 @@ public sealed class AiChatBehaviour : MonoBehaviour
             _ui.AddInlineExpressionControls(GlobalExpressions, SaveCurrentExpressionPreset,
                 ApplySavedExpressionPreset, AdjustFaceValue, DeleteExpressionPreset);
             var stageReady = _visible && _stage.Enter(CharacterCardPath);
-            _adapter = new CharacterAdapter(_character, LogSource!, () => _stage?.Human, motionId => _stage?.PlayMotion(motionId) == true) { PoseSetter = ApplyPoseFromAi };
-            _runner = new SequenceRunner(_adapter, text => { _stage.ShowText(text); Append($"{_stage.CharacterName ?? _character.Name}: {text}"); }, LogSource!);
+            _adapter = new CharacterAdapter(_character, LogSource!, () => _stage?.Human, motionId => _stage?.PlayMotion(motionId) == true) { PoseSetter = pose => ApplyPoseFromAi(pose) };
+            _ui.AddPartnerControls(AddPartner, SwapCharacters, RemovePartnerCharacter);
+            CreateRunner();
             _ui.SetVisible(_visible);
             if (OpenOnStartup) SetVisible(true);
             if (DiagnosticsEnabled) _diagnostics = new DiagnosticsFile(LogSource);
@@ -230,13 +251,29 @@ public sealed class AiChatBehaviour : MonoBehaviour
             try { BindCharacterProfile(); }
             catch (Exception ex) { _status = "character profile failed"; LogSource?.LogError(ex); }
         }
+        if (_partnerRestorePending && _stage?.IsReady == true && _stage.ActiveCardPath == _profileCardPath && !_requesting)
+        {
+            _partnerRestorePending = false;
+            var partnerCard = PartnerCardPathConfig?.Value;
+            if (!string.IsNullOrWhiteSpace(partnerCard) && File.Exists(partnerCard) && !_stage.HasPartner)
+            {
+                try { _stage.SetPartner(partnerCard); BindPartnerProfile(); }
+                catch (Exception ex) { _status = L.T("2人目を読み込めませんでした", "Could not load the second girl"); LogSource?.LogError(ex); }
+            }
+        }
         _diagnostics?.Tick(ExecuteTestCommand, DiagnosticState);
         if (_visible && !inH) _stage?.UpdateView(_ui?.InputFocused == true || _ui?.ModalOpen == true || OptionsBusy);
         if (_greetingPending && _visible && !OptionsBusy && _stage?.IsReady == true && _client != null
             && !_requesting && !_bridgeRestarting && _runner is { IsRunning: false })
         {
             _greetingPending = false;
-            RequestReply(GreetingInstruction, greeting: true);
+            RequestReply(_stage.HasPartner ? GroupGreetingInstruction : GreetingInstruction, greeting: true);
+        }
+        if (_aftermathPending && _visible && !inH && !OptionsBusy && _stage?.IsReady == true && _client != null
+            && !_requesting && !_bridgeRestarting && _runner is { IsRunning: false })
+        {
+            _aftermathPending = false;
+            RequestReply(AftermathInstruction(_stage.HasPartner), greeting: true);
         }
         if (_stage?.IsReady == true && (_status == "loading dedicated stage" || _status == "stage initialization failed"))
             _status = "ready / dedicated stage";
@@ -244,19 +281,26 @@ public sealed class AiChatBehaviour : MonoBehaviour
             _status = _stage?.IsReady == true ? "ready / dedicated stage" : "loading dedicated stage";
         _ui?.Refresh(
             _status,
-            L.T($"表示キャラクター: {_stage?.CharacterName ?? "読み込み中"}", $"Character: {_stage?.CharacterName ?? "loading"}"),
+            _stage?.HasPartner == true
+                ? L.T($"表示キャラクター: {_stage.CharacterName} ＆ {_stage.PartnerName}", $"Characters: {_stage.CharacterName} & {_stage.PartnerName}")
+                : L.T($"表示キャラクター: {_stage?.CharacterName ?? "読み込み中"}", $"Character: {_stage?.CharacterName ?? "loading"}"),
             _transcript,
-            _stage?.IsReady == true && (!_requesting || _greetingInFlight) && !_bridgeRestarting && (_runner is { IsRunning: false } || _greetingInFlight),
+            _stage?.IsReady == true && (!_requesting || _greetingInFlight) && !_bridgeRestarting && (_runner is { IsRunning: false } || _runner?.WaitingForReader == true || _greetingInFlight),
             _stage?.IsReady == true && !_requesting && _runner is { IsRunning: false },
             _adapter?.HasCharacter == true,
             _stage?.EyesFollowCamera == true,
             _stage?.NeckFollowsCamera == true,
             _adapter?.FaceParts() ?? (-1, -1, -1, 0, 0, 0),
             _adapter?.CaptureExpression());
-        _ui?.SetHInvite(_visible && !inH && _hInvite != null && _stage?.IsReady == true && !_requesting && _runner?.IsRunning != true);
+        var canH = _visible && !inH && _hInvite != null && _stage?.IsReady == true && !_requesting && _runner?.IsRunning != true;
+        var duoH = canH && _stage.HasPartner && !string.IsNullOrWhiteSpace(_stage.PartnerCardPath);
+        _ui?.SetHInvite(canH, duoH ? ShortName(SpeakerName(0)) : null, duoH ? ShortName(SpeakerName(1)) : null);
+        _ui?.SetHWatch(duoH);
         _ui?.SetPose(_stage?.IsReady == true ? _stage.IdlePose : -1,
             _stage?.IsReady == true && !_requesting && _runner?.IsRunning != true);
         _ui?.SetCoordinate(_stage?.IsReady == true ? _stage.Coordinate : -1,
+            _stage?.IsReady == true && !_requesting && _runner?.IsRunning != true);
+        _ui?.SetPartner(_stage?.HasPartner == true ? _stage.PartnerName : null,
             _stage?.IsReady == true && !_requesting && _runner?.IsRunning != true);
     }
 
@@ -280,8 +324,8 @@ public sealed class AiChatBehaviour : MonoBehaviour
             CharacterCardPath = selected;
         }
         _visible = visible;
-        if (visible) { _stage?.Enter(CharacterCardPath); _greetingPending = true; }
-        else { Cancel(); _adapter?.RestoreOutfit(); _stage?.Exit(); }
+        if (visible) { _stage?.Enter(CharacterCardPath); _greetingPending = true; _partnerRestorePending = true; }
+        else { Cancel(); _adapter?.RestoreOutfit(); _partnerAdapter?.RestoreOutfit(); _stage?.Exit(); _partnerCharacter = null; _partnerAdapter = null; }
         _ui?.SetVisible(visible);
     }
 
@@ -481,19 +525,23 @@ public sealed class AiChatBehaviour : MonoBehaviour
     private void SwitchCharacter(int direction)
     {
         Cancel();
-        try { _adapter?.RestoreOutfit(); _stage?.SelectCard(direction); BindCharacterProfile(); _history.Clear(); _status = L.T("会話できます", "Ready to talk"); }
+        try { _adapter?.RestoreOutfit(); _stage?.SelectCard(direction); BindCharacterProfile(); _history.Clear(); _hMemories.Clear(); _status = L.T("会話できます", "Ready to talk"); }
         catch (Exception ex) { LogSource?.LogError(ex); _status = "character load failed"; }
     }
 
     // The AI's pose choice is persisted like the manual button so the idle stays after the reply.
-    private bool ApplyPoseFromAi(int pose)
+    private bool ApplyPoseFromAi(int pose, int slot = 0)
     {
-        if (_stage?.IsReady != true || !_stage.SetIdlePose(pose)) return false;
-        _character.IdlePose = pose;
+        if (slot == 1 && !_stage.HasPartner) slot = 0;
+        if (_stage?.IsReady != true || !_stage.SetIdlePose(pose, true, slot)) return false;
+        var config = slot == 1 ? _partnerCharacter : _character;
+        var card = slot == 1 ? _stage.PartnerCardPath : _stage.ActiveCardPath;
+        if (config == null) return true;
+        config.IdlePose = pose;
         try
         {
-            if (!string.IsNullOrWhiteSpace(_stage.ActiveCardPath))
-                CharacterConfig.SaveForCard(Path.GetFullPath(CharacterConfigPath), _stage.ActiveCardPath, _character);
+            if (!string.IsNullOrWhiteSpace(card))
+                CharacterConfig.SaveForCard(Path.GetFullPath(CharacterConfigPath), card, config);
         }
         catch (Exception ex) { LogSource?.LogWarning("pose save failed: " + ex.Message); }
         return true;
@@ -521,8 +569,10 @@ public sealed class AiChatBehaviour : MonoBehaviour
     {
         if (_stage?.IsReady != true || _requesting || _runner?.IsRunning == true) return;
         var states = _adapter?.CaptureOutfitStates();
+        var partnerStates = _stage.HasPartner ? _partnerAdapter?.CaptureOutfitStates() : null;
         if (!_stage.SwitchCoordinate()) { _status = L.T("衣装を切り替えられませんでした", "Could not switch the outfit"); return; }
         if (states != null) _adapter.ApplyOutfitStates(states);
+        if (partnerStates != null) _partnerAdapter.ApplyOutfitStates(partnerStates);
         _status = L.T("衣装を切り替えました", "Switched the outfit");
     }
 
@@ -540,7 +590,7 @@ public sealed class AiChatBehaviour : MonoBehaviour
             _adapter?.RestoreOutfit();
             _stage.SelectCard(fullPath);
             BindCharacterProfile();
-            _history.Clear();
+            _history.Clear(); _hMemories.Clear();
             _status = L.T("キャラを読み込みました", "Loaded the character");
         }
         catch (Exception ex)
@@ -725,15 +775,19 @@ public sealed class AiChatBehaviour : MonoBehaviour
         if (!_adapter.AdjustFaceValue(part, delta)) _status = L.T("開閉値を変更できませんでした", "Could not change the openness");
     }
 
-    private string LoadPersonalityFile()
+    // scene: the shared scene tab, which keeps its files in a folder of its own.
+    private string LoadPersonalityFile(bool scene)
     {
         try
         {
-            Directory.CreateDirectory(PersonalityFile.Directory);
-            var path = NativeFilePicker.OpenPersonality(PersonalityFile.Directory);
+            var directory = scene ? PersonalityFile.SceneDirectory : PersonalityFile.Directory;
+            Directory.CreateDirectory(directory);
+            var path = scene ? NativeFilePicker.OpenSceneContext(directory) : NativeFilePicker.OpenPersonality(directory);
             if (path == null) return null;
             var prompt = PersonalityFile.Load(path);
-            _status = L.T($"性格ファイルを読み込みました: {Path.GetFileName(path)}", $"Loaded the personality file: {Path.GetFileName(path)}");
+            _status = scene
+                ? L.T($"場面ファイルを読み込みました: {Path.GetFileName(path)}", $"Loaded the scene context file: {Path.GetFileName(path)}")
+                : L.T($"性格ファイルを読み込みました: {Path.GetFileName(path)}", $"Loaded the personality file: {Path.GetFileName(path)}");
             return prompt;
         }
         catch (Exception ex)
@@ -744,7 +798,7 @@ public sealed class AiChatBehaviour : MonoBehaviour
         }
     }
 
-    private bool? SavePersonalityFile(string prompt)
+    private bool? SavePersonalityFile(string prompt, bool scene)
     {
         if (string.IsNullOrWhiteSpace(prompt) || prompt.Length > 4000)
         {
@@ -753,11 +807,14 @@ public sealed class AiChatBehaviour : MonoBehaviour
         }
         try
         {
-            Directory.CreateDirectory(PersonalityFile.Directory);
-            var path = NativeFilePicker.SavePersonality(PersonalityFile.Directory);
+            var directory = scene ? PersonalityFile.SceneDirectory : PersonalityFile.Directory;
+            Directory.CreateDirectory(directory);
+            var path = scene ? NativeFilePicker.SaveSceneContext(directory) : NativeFilePicker.SavePersonality(directory);
             if (path == null) return null;
             PersonalityFile.Save(path, prompt.Trim());
-            _status = L.T($"性格ファイルを保存しました: {Path.GetFileName(path)}", $"Saved the personality file: {Path.GetFileName(path)}");
+            _status = scene
+                ? L.T($"場面ファイルを保存しました: {Path.GetFileName(path)}", $"Saved the scene context file: {Path.GetFileName(path)}")
+                : L.T($"性格ファイルを保存しました: {Path.GetFileName(path)}", $"Saved the personality file: {Path.GetFileName(path)}");
             return true;
         }
         catch (Exception ex)
@@ -778,12 +835,10 @@ public sealed class AiChatBehaviour : MonoBehaviour
         _character.Expressions = _globalExpressions;
         _character.MotionDescriptions ??= new(StringComparer.OrdinalIgnoreCase);
         MigrateMotions(_character);
-        _adapter = new CharacterAdapter(_character, LogSource!, () => _stage?.Human,
-            motionId => _stage?.PlayMotion(motionId) == true) { PoseSetter = ApplyPoseFromAi };
-        _runner = new SequenceRunner(_adapter,
-            text => { _stage.ShowText(text); Append($"{_stage.CharacterName ?? _character.Name}: {text}"); }, LogSource!);
+        _adapter = CreateAdapter(_character, _stage.Human);
+        CreateRunner();
         _profileCardPath = _stage.ActiveCardPath;
-        _history.Clear();
+        _history.Clear(); _hMemories.Clear();
         _greetingPending = true;
         if (!string.IsNullOrWhiteSpace(_profileCardPath) && CardPathConfig != null)
             CharacterCardPath = CardPathConfig.Value = _profileCardPath;
@@ -793,6 +848,179 @@ public sealed class AiChatBehaviour : MonoBehaviour
         _stage.SetIdlePose(_character.IdlePose);
         LogSource?.LogInfo($"Character profile ready: id={_character.Id}, expressions={_character.Expressions.Count}, motions={_character.Motions.Count}");
     }
+
+    // An adapter follows its character's Human, not a slot, so it stays right when the two swap places.
+    [HideFromIl2Cpp]
+    private CharacterAdapter CreateAdapter(CharacterConfig config, Character.Human human) =>
+        new(config, LogSource!, () => human, motionId => _stage?.PlayMotion(motionId, _stage.SlotOf(human)) == true)
+        { PoseSetter = pose => ApplyPoseFromAi(pose, _stage.SlotOf(human)) };
+
+    [HideFromIl2Cpp]
+    private CharacterAdapter AdapterAt(int slot) => slot == 1 && _stage?.HasPartner == true && _partnerAdapter != null ? _partnerAdapter : _adapter;
+
+    private string SpeakerName(int slot) => slot == 1 && _stage?.HasPartner == true
+        ? _stage.PartnerName ?? _partnerCharacter?.Name
+        : _stage?.CharacterName ?? _character?.Name;
+
+    private void CreateRunner()
+    {
+        _runner = new SequenceRunner(AdapterAt,
+            (text, slot, more) => { _stage.ShowText(text, slot, more); Append($"{SpeakerName(slot)}: {text}"); },
+            () => _stage?.WaitingForNextTurn == true, LogSource!);
+    }
+
+    // The shared scene context sits next to the character config, one file per language.
+    private static string SceneContextPath => Path.Combine(Path.GetDirectoryName(Path.GetFullPath(CharacterConfigPath))!,
+        L.En ? "scene-context-en.txt" : "scene-context.txt");
+
+    // Used until the player writes their own; matches the game's own premise.
+    // Same text as the bundled island.json scene file.
+    private static string DefaultSceneContext => L.T(
+        "南の島で夏休みを過ごしている。ここにいる全員が休暇中で、のんびりと楽しい時間を過ごしている。\n\n動作はアスタリスクで表すことができます。例:\n「*走り出しながら* じゃあ、またあとでね！」\n「えっ!? *驚いて口をぽかんと開ける*」\n「わ、私も混ざっていい？ *二人をちらっと見る* お願い」",
+        "Everyone here is spending a summer vacation on a southern island, relaxing and simply enjoying their time together.\n\nYou can express actions using asterisks for it. For example:\n\"*I start running* See you later!\"\n\"What!? *I open my mouth surprised*\"\n\"Can... can I join? *I glance at you guys* Please?\"");
+
+    private string LoadSceneContext()
+    {
+        try
+        {
+            if (File.Exists(SceneContextPath)) return File.ReadAllText(SceneContextPath).Trim();
+            File.WriteAllText(SceneContextPath, DefaultSceneContext);
+            return DefaultSceneContext;
+        }
+        catch (Exception ex) { LogSource?.LogWarning($"Scene context could not be loaded: {ex.Message}"); return ""; }
+    }
+
+    // Context editor tabs: 0 the shared scene, 1 the main girl, 2 the second girl (null name when absent).
+    private string ContextName(int target) => target switch
+    {
+        0 => L.T("場面", "Scene"),
+        1 => _stage?.CharacterName ?? _character?.Name,
+        _ => _stage?.HasPartner == true ? SpeakerName(1) : null
+    };
+
+    private string ContextText(int target) => target switch
+    {
+        0 => _sceneContext,
+        1 => _character?.SystemPrompt,
+        _ => _stage?.HasPartner == true ? _partnerCharacter?.SystemPrompt : null
+    };
+
+    private bool ApplyContext(int target, string text)
+    {
+        if (target == 1) return SavePersonalityPrompt(text);
+        if (text != null && text.Length > 4000)
+        {
+            _status = L.T("4000文字以内で入力してください", "The text must be at most 4000 characters");
+            return false;
+        }
+        try
+        {
+            if (target == 0)
+            {
+                File.WriteAllText(SceneContextPath, text?.Trim() ?? "");
+                _sceneContext = text?.Trim() ?? "";
+                _status = L.T("場面の説明を保存しました（次の会話から反映）", "Saved the scene context (used from the next message)");
+                return true;
+            }
+            if (_stage?.HasPartner != true || _partnerCharacter == null || string.IsNullOrWhiteSpace(_stage.PartnerCardPath)
+                || string.IsNullOrWhiteSpace(text)) return false;
+            var previous = _partnerCharacter.SystemPrompt;
+            _partnerCharacter.SystemPrompt = text.Trim();
+            try { CharacterConfig.SaveForCard(Path.GetFullPath(CharacterConfigPath), _stage.PartnerCardPath, _partnerCharacter); }
+            catch { _partnerCharacter.SystemPrompt = previous; throw; }
+            _status = L.T("2人目の性格を保存しました（次の会話から反映）", "Saved the second girl's personality (used from the next message)");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _status = L.T($"保存に失敗: {ex.Message}", $"Could not save: {ex.Message}");
+            LogSource?.LogError(ex);
+            return false;
+        }
+    }
+
+    private void BindPartnerProfile()
+    {
+        if (_stage?.HasPartner != true || string.IsNullOrWhiteSpace(_stage.PartnerCardPath)) return;
+        _partnerCharacter = CharacterConfig.LoadOrCreateForCard(Path.GetFullPath(CharacterConfigPath),
+            _baseCharacter, _stage.PartnerCardPath, _stage.PartnerName ?? L.T("キャラクター", "Character"));
+        _partnerCharacter.Expressions = _globalExpressions;
+        _partnerCharacter.MotionDescriptions ??= new(StringComparer.OrdinalIgnoreCase);
+        MigrateMotions(_partnerCharacter);
+        _partnerAdapter = CreateAdapter(_partnerCharacter, _stage.PartnerHuman);
+        _stage.SetIdlePose(_partnerCharacter.IdlePose, true, 1);
+        if (PartnerCardPathConfig != null) PartnerCardPathConfig.Value = _stage.PartnerCardPath;
+        LogSource?.LogInfo($"Second character profile ready: id={_partnerCharacter.Id}");
+    }
+
+    private void AddPartner()
+    {
+        if (_stage?.IsReady != true || _requesting || _runner?.IsRunning == true) return;
+        try
+        {
+            var path = NativeFilePicker.ChooseCard(_stage.PartnerCardPath ?? _stage.ActiveCardPath);
+            if (path == null) return;
+            Cancel();
+            _partnerAdapter?.RestoreOutfit();
+            _stage.SetPartner(path);
+            BindPartnerProfile();
+            _history.Clear(); _hMemories.Clear();
+            _greetingPending = true;
+            _status = L.T("2人目を呼びました", "The second girl joined");
+        }
+        catch (Exception ex)
+        {
+            _status = L.T($"カード読込失敗: {ex.Message}", $"Could not load the card: {ex.Message}");
+            LogSource?.LogError(ex);
+        }
+    }
+
+    private void RemovePartnerCharacter()
+    {
+        if (_stage?.HasPartner != true || _requesting || _runner?.IsRunning == true) return;
+        Cancel();
+        _partnerAdapter?.RestoreOutfit();
+        _stage.RemovePartner();
+        _partnerCharacter = null;
+        _partnerAdapter = null;
+        if (PartnerCardPathConfig != null) PartnerCardPathConfig.Value = "";
+        _history.Clear(); _hMemories.Clear();
+        _greetingPending = true;
+        _status = L.T("1人に戻しました", "Back to one girl");
+    }
+
+    // The second girl becomes the main one (personality editor, pose button, card shown) and vice versa.
+    private void SwapCharacters()
+    {
+        if (_stage?.HasPartner != true || _requesting || _runner?.IsRunning == true || _partnerCharacter == null) return;
+        Cancel();
+        _stage.SwapPartner();
+        (_character, _partnerCharacter) = (_partnerCharacter, _character);
+        (_adapter, _partnerAdapter) = (_partnerAdapter, _adapter);
+        _profileCardPath = _stage.ActiveCardPath;
+        if (CardPathConfig != null) CharacterCardPath = CardPathConfig.Value = _profileCardPath;
+        if (PartnerCardPathConfig != null) PartnerCardPathConfig.Value = _stage.PartnerCardPath;
+        _ui?.SetSelectedCardPath(_profileCardPath);
+        _ui?.SetPersonalityPrompt(_character.SystemPrompt);
+        _ui?.ClosePersonalityEditor();
+        _status = L.T("2人を入れ替えました", "Swapped the two girls");
+    }
+
+    [HideFromIl2Cpp]
+    private Dictionary<string, string> CurrentOutfit(CharacterAdapter adapter) =>
+        (adapter?.CaptureOutfitStates() ?? new())
+            .Where(pair => (int)pair.Key < OutfitIntent.PartKeys.Length)
+            .ToDictionary(pair => OutfitIntent.PartKeys[(int)pair.Key], pair =>
+            {
+                var state = pair.Value switch
+                {
+                    Character.HumanCloth.Define.ClothesState.Clothing => "on",
+                    Character.HumanCloth.Define.ClothesState.HalfUndress => "half",
+                    _ => "off"
+                };
+                var name = adapter.ClothesName(pair.Key);
+                return string.IsNullOrWhiteSpace(name) ? state : $"{state}({name})";
+            });
 
     private static void MigrateMotions(CharacterConfig config)
     {
@@ -858,6 +1086,8 @@ public sealed class AiChatBehaviour : MonoBehaviour
     private void SendText(string text)
     {
         if (_greetingInFlight) Cancel();
+        // A line still waiting for the page turn must not lock the input: a new message skips the rest.
+        if (_runner?.WaitingForReader == true && !_requesting && !string.IsNullOrWhiteSpace(text)) _runner.Cancel();
         if (_character == null || _runner == null || _requesting || _bridgeRestarting || _runner.IsRunning || _stage?.IsReady != true) return;
         if (string.IsNullOrWhiteSpace(text)) return;
         _ui.ClearInput();
@@ -879,26 +1109,26 @@ public sealed class AiChatBehaviour : MonoBehaviour
         var historySnapshot = _history.TakeLast(Math.Clamp(Settings.HistoryMessages.Value, 0, 200)).ToArray();
         var outfitActions = _adapter?.AvailableOutfitActions() ?? Array.Empty<string>();
         // The AI needs the present state of each worn part to know what a request actually changes.
-        var currentOutfit = (_adapter?.CaptureOutfitStates() ?? new())
-            .Where(pair => (int)pair.Key < OutfitIntent.PartKeys.Length)
-            .ToDictionary(pair => OutfitIntent.PartKeys[(int)pair.Key], pair =>
-            {
-                var state = pair.Value switch
-                {
-                    Character.HumanCloth.Define.ClothesState.Clothing => "on",
-                    Character.HumanCloth.Define.ClothesState.HalfUndress => "half",
-                    _ => "off"
-                };
-                var name = _adapter.ClothesName(pair.Key);
-                return string.IsNullOrWhiteSpace(name) ? state : $"{state}({name})";
-            });
+        var currentOutfit = CurrentOutfit(_adapter);
+        var group = _stage.HasPartner && _partnerCharacter != null && _partnerAdapter != null;
+        var sceneContext = SceneWithMemories();
+        var characters = group ? new object[]
+        {
+            new { name = SpeakerName(0), system_prompt = _character.SystemPrompt,
+                available_outfit_actions = outfitActions, current_outfit = currentOutfit },
+            new { name = SpeakerName(1), system_prompt = _partnerCharacter.SystemPrompt,
+                available_outfit_actions = _partnerAdapter.AvailableOutfitActions(), current_outfit = CurrentOutfit(_partnerAdapter) }
+        } : null;
         var character = new CharacterConfig
         {
             Id = _stage.CharacterName ?? _character.Id,
             Name = _stage.CharacterName ?? _character.Name,
             SystemPrompt = _character.SystemPrompt,
             Expressions = _character.Expressions,
-            Motions = _character.Motions,
+            // The game's chat motions are exercises (stretches, knee bends) that look wrong in conversation;
+            // the AI moves only through the standing poses also offered in the menu, plus idle.
+            Motions = _character.Motions.Where(pair => string.Equals(pair.Key, "idle", StringComparison.OrdinalIgnoreCase))
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase),
             MotionDescriptions = _character.MotionDescriptions
         };
 
@@ -906,41 +1136,51 @@ public sealed class AiChatBehaviour : MonoBehaviour
         {
             try
             {
-                var envelope = await _client.CompleteAsync(character, historySnapshot, text, outfitActions, currentOutfit, token);
+                var envelope = await _client.CompleteAsync(character, historySnapshot, text, outfitActions, currentOutfit, characters, sceneContext, token);
                 _mainThread.Enqueue(() =>
                 {
                     if (generation != _requestGeneration || token.IsCancellationRequested) return;
                     if (!string.IsNullOrWhiteSpace(envelope.Thinking))
                         LogSource?.LogInfo($"[Ollama thinking]\n{envelope.Thinking}");
+                    if (!string.IsNullOrWhiteSpace(envelope.Decisions))
+                        LogSource?.LogInfo($"[Model decisions] {envelope.Decisions}");
                     var commands = SequenceValidator.Validate(envelope,
                         character.Expressions.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase),
                         character.Motions.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase),
                         warning => LogSource?.LogWarning(warning)).ToList();
                     if (commands.Count == 0) throw new InvalidDataException("Bridge returned no valid commands.");
-                    // Commit the single structured clothing action before speaking.
+                    // A reply for two characters names each command's character; without the second one on
+                    // stage (removed meanwhile) everything goes to the main character.
+                    foreach (var command in commands)
+                        if (command.Type != "h_invite" || !group) command.Target = group ? (command.Target == 1 ? 1 : 0) : null;
+                    // Commit each character's structured clothing action before speaking.
                     // Otherwise the generated dialogue could claim a change that the
                     // current card rejects when SequenceRunner reaches the action.
-                    var outfitCommand = commands.FirstOrDefault(command => command.Type == "outfit");
-                    if (outfitCommand != null)
+                    foreach (var outfitCommand in commands.Where(command => command.Type == "outfit").ToList())
                     {
-                        var applied = _adapter?.SetOutfit(outfitCommand.Value!) == true;
-                        commands.RemoveAll(command => command.Type == "outfit");
+                        var target = outfitCommand.Target ?? 0;
+                        var applied = AdapterAt(target)?.SetOutfit(outfitCommand.Value!) == true;
+                        commands.Remove(outfitCommand);
                         // Unsupported parts are skipped silently and the character keeps its own wording;
                         // only a change that did nothing at all is corrected so the reply cannot claim it.
                         if (!applied)
                         {
-                            foreach (var command in commands.Where(command => command.Type == "text"))
+                            foreach (var command in commands.Where(command => command.Type == "text" && (command.Target ?? 0) == target))
                                 command.Value = L.T("今の衣装では、変えられる部分がなかったよ。", "There was nothing on me that could change like that.");
-                            LogSource?.LogInfo($"LLM outfit action had no applicable parts: {outfitCommand.Value}");
+                            LogSource?.LogInfo($"LLM outfit action had no applicable parts: {outfitCommand.Value} (target {target})");
                         }
                     }
                     // An invitation to H only offers the button; the player decides whether to go.
-                    _hInvite = commands.LastOrDefault(command => command.Type == "h_invite")?.Value;
+                    var invite = commands.LastOrDefault(command => command.Type == "h_invite");
+                    _hInvite = invite?.Value;
+                    _hInviteWith = group ? invite?.Target ?? -1 : 0;
                     commands.RemoveAll(command => command.Type == "h_invite");
-                    if (_hInvite != null) LogSource?.LogInfo($"LLM invited to H: {_hInvite}");
+                    if (_hInvite != null) LogSource?.LogInfo($"LLM invited to H: {_hInvite}, with={_hInviteWith}");
                     // The greeting instruction is not something the player said, so it stays out of history.
                     if (!greeting) _history.Add(new HistoryItem("user", text));
-                    var reply = string.Join(" ", commands.Where(c => c.Type == "text").Select(c => c.Value));
+                    var reply = group
+                        ? string.Join("\n", commands.Where(c => c.Type == "text").Select(c => $"{SpeakerName(c.Target ?? 0)}: {c.Value}"))
+                        : string.Join(" ", commands.Where(c => c.Type == "text").Select(c => c.Value));
                     if (!string.IsNullOrWhiteSpace(reply)) _history.Add(new HistoryItem("assistant", reply));
                     if (!string.IsNullOrWhiteSpace(reply)) LogDialogue("assistant", reply, greeting ? "llm-greeting" : "llm");
                     var keep = Math.Max(60, Math.Clamp(Settings.HistoryMessages.Value, 0, 200));
@@ -1085,41 +1325,86 @@ public sealed class AiChatBehaviour : MonoBehaviour
                 StartH(hArgs[0] == "" ? Settings.HMap.Value : int.Parse(hArgs[0]),
                     hArgs.Length > 1 && hArgs[1] != "" ? Enum.Parse<AL.H.PlaceType>(hArgs[1], true) : AL.H.PlaceType.Floor,
                     hArgs.Length > 2 && hArgs[2] != "" && hArgs[2] != "any" ? Enum.Parse<AL.H.Define.PostureCategory>(hArgs[2], true) : null,
-                    hArgs.Length > 3 && bool.Parse(hArgs[3]));
+                    hArgs.Length > 3 && bool.Parse(hArgs[3]), _stage?.HasPartner == true ? -1 : 0);
                 break;
             default: throw new ArgumentException("Unsupported diagnostic action");
         }
     }
 
-    private void AcceptHInvite()
+    // girlsOnly: the two girls on stage alone (no male), the player watches.
+    // with: the girl the player picked (0, 1) or -1 for both; the AI's own guess is not used, the player decides.
+    private void AcceptHInvite(int with, bool girlsOnly)
     {
         var lewd = _hInvite == "lewd";
         _hInvite = null;
-        try { StartH(Settings.HMap.Value, AL.H.PlaceType.Floor, null, lewd); }
+        try { StartH(Settings.HMap.Value, AL.H.PlaceType.Floor, null, lewd, with, girlsOnly); }
         catch (Exception ex) { _status = L.T("Hシーンに移れませんでした", "Could not enter the H scene"); LogSource?.LogError(ex); }
     }
 
     // Hands the screen to the game's H scene with the current character; the chat returns when it ends.
-    private void StartH(int mapId, AL.H.PlaceType place, AL.H.Define.PostureCategory? category, bool lewd)
+    // with: who joins from the chat stage: 0 the main girl, 1 only the second girl, -1 both (1 male / 2 females).
+    private void StartH(int mapId, AL.H.PlaceType place, AL.H.Define.PostureCategory? category, bool lewd, int with = 0, bool girlsOnly = false)
     {
         if (_requesting || _runner.IsRunning || _stage?.IsReady != true) throw new InvalidOperationException("Not ready");
+        var duo = _stage.HasPartner && !string.IsNullOrWhiteSpace(_stage.PartnerCardPath);
         var data = new Character.HumanData((byte)1);
-        var card = _stage.ActiveCardPath;
+        var card = duo && with == 1 ? _stage.PartnerCardPath : _stage.ActiveCardPath;
         if (card == null ? !data.LoadFromPreset(1) : !data.LoadCharaFile(card))
             throw new InvalidDataException("The character could not be loaded for H.");
+        // The second girl on stage joins when the player picked both.
+        Character.HumanData partner = null;
+        var partnerCard = duo && with == -1 ? _stage.PartnerCardPath : null;
+        girlsOnly &= duo && with == -1;
+        if (!string.IsNullOrWhiteSpace(partnerCard))
+        {
+            partner = new Character.HumanData((byte)1);
+            if (!File.Exists(partnerCard) || !partner.LoadCharaFile(Path.GetFullPath(partnerCard)))
+                throw new InvalidDataException("The second character could not be loaded for H.");
+        }
         _h.MaleCard = Settings.HMaleCard.Value;
         _stage.Suspend();
         try
         {
-            _h.Start(data, mapId, place, category, lewd, () =>
+            _h.Start(data, partner, mapId, place, category, lewd, () =>
             {
                 _stage?.Resume();
                 _status = _h.Error == null ? "ready / dedicated stage" : L.T("Hシーンに移れませんでした", "Could not enter the H scene");
-            });
+                if (_h.Error == null) RememberH(duo, with, girlsOnly);
+            }, girlsOnly);
         }
         catch { _stage.Resume(); throw; }
         _status = "H scene";
     }
+
+    // Sums up the scene that just ended for the girls' memory, then asks them to react once the stage is back.
+    private void RememberH(bool duo, int with, bool girlsOnly)
+    {
+        try
+        {
+            if (_h.Record == null) return;
+            // Every girl on stage is described; one who never appeared in a posture was watching.
+            var girls = duo ? new[] { SpeakerName(0), SpeakerName(1) } : new[] { SpeakerName(0) };
+            var summary = _h.Record.Describe(girls, Settings.HShareLocation.Value);
+            _hMemories.Add(summary);
+            if (_hMemories.Count > 3) _hMemories.RemoveAt(0);
+            _aftermathPending = true;
+            LogSource?.LogInfo($"H summary for the chat: {summary}");
+        }
+        catch (Exception ex) { LogSource?.LogWarning($"H summary failed: {ex.Message}"); }
+    }
+
+    private string SceneWithMemories() => _hMemories.Count == 0 ? _sceneContext
+        : (_sceneContext + "\n\n" + L.T("これまでに起きたこと（必ず覚えておくこと。最後が一番新しい）:", "What has already happened between you (remember it; the last one is the most recent):")
+           + "\n- " + string.Join("\n- ", _hMemories)).Trim();
+
+    private static string AftermathInstruction(bool group) => group
+        ? L.T("（たった今、場面の説明の「これまでに起きたこと」の最後にある出来事から戻ってきました。二人とも、キャラクターらしく、今起きたことへの気持ちや具体的な感想を自然に話してください。一人だけでも二人でも構いません。見ていただけの子は、すべてを見ていた立場で反応してください。）",
+               "(You are all just back from the last event under \"What has already happened\" in the scene context. React to it now, in character: how you feel about what just happened and about the player, mentioning concrete details you remember. One or both of you may speak. A girl who only watched reacts as someone who saw all of it.)")
+        : L.T("（たった今、場面の説明の「これまでに起きたこと」の最後にある出来事から戻ってきました。キャラクターらしく、今起きたことへの気持ちや具体的な感想を自然に話してください。）",
+              "(You are just back from the last event under \"What has already happened\" in the scene context. React to it now, in character: how you feel about what just happened and about the player, mentioning concrete details you remember.)");
+
+    // "Mizuno Aoi" -> "Aoi": the game's full names put the given name last.
+    private static string ShortName(string name) => name?.Trim().Split(' ').LastOrDefault() ?? "";
 
     private void Append(string line)
     {
@@ -1133,7 +1418,8 @@ public sealed class AiChatBehaviour : MonoBehaviour
         _requestCancellation?.Cancel();
         _requestCancellation?.Dispose();
         _client?.Dispose();
-        _adapter?.RestoreOutfit();
+        // At game exit the clothes may already be disposed; nothing is left to restore then.
+        try { _adapter?.RestoreOutfit(); } catch (Exception ex) { LogSource?.LogDebug($"Outfit not restored at exit: {ex.Message}"); }
         _stage?.Dispose();
         _ui?.Dispose();
         _titleEntry?.Dispose();

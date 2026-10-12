@@ -97,10 +97,14 @@ internal sealed class DedicatedChatUi : IDisposable
     private GameObject _advancedOverlay;
     private GameObject _hOverlay;
     private Button _hInvite;
+    private Button _hWatch;
+    private Button _hGirlA, _hGirlB;
     private TMP_Text _hMaleLabel;
     private TMP_Text _hMapLabel;
     private Func<string> _hMaleText;
     private Func<string> _hMapText;
+    private Func<string> _hLocationText;
+    private TMP_Text _hLocationLabel;
     private TMP_InputField _maxReplyInput;
     private TMP_InputField _contextInput;
     private TMP_InputField _historyInput;
@@ -110,6 +114,12 @@ internal sealed class DedicatedChatUi : IDisposable
     private string _provider = "ollama";
     private bool _logThinking;
     private string _savedPersonalityPrompt = "";
+    // Context editor: tab 0 is the shared scene, 1 the main girl, 2 the second girl (hidden without her).
+    private readonly Button[] _contextTabs = new Button[3];
+    private TMP_Text _personalityTitle, _personalityHelp;
+    private int _contextTarget = 1;
+    private Func<int, string> _contextName, _contextText;
+    private Func<int, string, bool> _contextApply;
     private readonly TMP_Text _status;
     private readonly TMP_Text _help;
     private readonly TMP_Text _character;
@@ -173,7 +183,7 @@ internal sealed class DedicatedChatUi : IDisposable
     }
     public void Suspend(bool suspended) { _root.SetActive(!suspended); }
 
-    public DedicatedChatUi(Action send, Action uiTest, Action performanceTest, Action cancel, Action close, Action previous, Action next, Action chooseCard, Func<string, bool> applyPersonality, Func<string> loadPersonality, Func<string, bool?> savePersonalityFile, Func<BackendSettings> loadBackendSettings, Action<BackendSettings> saveBackendSettings, Action testBackendConnection, Action restartBridge, Action left, Action right, Action near, Action far, Action<string, int> adjustFace, Action toggleEyeMode, Action toggleNeckMode, Action switchCoordinate, Action<int> cyclePose, ModSettings settings)
+    public DedicatedChatUi(Action send, Action uiTest, Action performanceTest, Action cancel, Action close, Action previous, Action next, Action chooseCard, Func<string, bool> applyPersonality, Func<bool, string> loadPersonality, Func<string, bool, bool?> savePersonalityFile, Func<BackendSettings> loadBackendSettings, Action<BackendSettings> saveBackendSettings, Action testBackendConnection, Action restartBridge, Action left, Action right, Action near, Action far, Action<string, int> adjustFace, Action toggleEyeMode, Action toggleNeckMode, Action switchCoordinate, Action<int> cyclePose, ModSettings settings)
     {
         _settings = settings;
         _font = FindFont(settings.UiFontFile.Value);
@@ -242,52 +252,62 @@ internal sealed class DedicatedChatUi : IDisposable
 
         _selectedCard = MakeText("SelectedCard", panel, L.T("カード: 未選択", "Card: none"), 14, new Vector2(14, -265), new Vector2(450, 22));
         MakeButton(panel, L.T("ファイルから選択…", "Open card…"), new Vector2(14, -290), new Vector2(150, 30), chooseCard);
-        MakeButton(panel, L.T("性格・口調を編集", "Personality…"), new Vector2(170, -290), new Vector2(150, 30), OpenPersonalityEditor);
+        MakeButton(panel, L.T("場面・性格を編集", "Context…"), new Vector2(170, -290), new Vector2(150, 30), OpenPersonalityEditor);
         _coordinateButton = MakeButton(panel, L.T("衣装: -", "Outfit: -"), new Vector2(326, -290), new Vector2(140, 30), switchCoordinate);
         _coordinateLabel = _coordinateButton.GetComponentInChildren<TMP_Text>();
 
         var overlay = MakeRect("PersonalityEditorOverlay", _root.transform, Vector2.zero, new Vector2(1600, 900));
         _personalityOverlay = overlay.gameObject;
         overlay.gameObject.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0.7f);
-        var editor = MakeRect("PersonalityEditor", overlay, new Vector2(500, -155), new Vector2(600, 560));
+        var editor = MakeRect("PersonalityEditor", overlay, new Vector2(500, -135), new Vector2(600, 600));
         editor.gameObject.AddComponent<Image>().color = new Color(0.07f, 0.09f, 0.14f, 0.98f);
-        MakeText("PersonalityTitle", editor, L.T("性格・口調の指示", "Personality and speaking style"), 22, new Vector2(20, -14), new Vector2(560, 32));
-        MakeText("PersonalityHelp", editor, L.T("キャラの振る舞いだけを記述します。出力形式・動作ルールは編集対象外です。", "Describe only how the character behaves. Output format and action rules are not editable here."), 14,
-            new Vector2(20, -50), new Vector2(560, 24));
-        _personalityInput = MakeInput(editor, new Vector2(20, -82), new Vector2(560, 350), L.T("性格、口調、相手への接し方など", "Personality, speaking style, how she treats you…"), 16);
+        _personalityTitle = MakeText("PersonalityTitle", editor, L.T("性格・口調の指示", "Personality and speaking style"), 22, new Vector2(20, -14), new Vector2(560, 32));
+        // Tabs: the shared scene, then one personality per girl on stage.
+        for (var tab = 0; tab < _contextTabs.Length; tab++)
+        {
+            var target = tab;
+            _contextTabs[tab] = MakeButton(editor, "", new Vector2(20 + tab * 188, -50), new Vector2(182, 30), () => SelectContextTab(target));
+        }
+        _personalityHelp = MakeText("PersonalityHelp", editor, L.T("キャラの振る舞いだけを記述します。出力形式・動作ルールは編集対象外です。", "Describe only how the character behaves. Output format and action rules are not editable here."), 14,
+            new Vector2(20, -88), new Vector2(560, 24));
+        _personalityInput = MakeInput(editor, new Vector2(20, -122), new Vector2(560, 350), L.T("性格、口調、相手への接し方など", "Personality, speaking style, how she treats you…"), 16);
         _personalityInput.lineType = TMP_InputField.LineType.MultiLineNewline;
         _personalityInput.characterLimit = 4000;
         _personalityInput.textComponent.alignment = TextAlignmentOptions.TopLeft;
-        MakeButton(editor, L.T("カードへ適用", "Apply to card"), new Vector2(20, -447), new Vector2(125, 34), () =>
+        MakeButton(editor, L.T("適用", "Apply"), new Vector2(20, -487), new Vector2(125, 34), () =>
         {
-            if (applyPersonality(_personalityInput.text))
+            if (_contextApply != null ? _contextApply(_contextTarget, _personalityInput.text) : applyPersonality(_personalityInput.text))
             {
                 _savedPersonalityPrompt = _personalityInput.text.Trim();
-                _personalityFeedback.text = L.T("カードに適用しました", "Applied to the card.");
+                _personalityFeedback.text = _contextTarget == 0 ? L.T("場面に適用しました", "Applied to the scene.") : L.T("カードに適用しました", "Applied to the card.");
             }
             else _personalityFeedback.text = L.T("適用できませんでした。入力とログを確認してください", "Could not apply. Check the text and the log.");
         });
-        MakeButton(editor, L.T("ファイルを開く…", "Open file…"), new Vector2(151, -447), new Vector2(140, 34), () =>
+        MakeButton(editor, L.T("ファイルを開く…", "Open file…"), new Vector2(151, -487), new Vector2(140, 34), () =>
         {
-            var prompt = loadPersonality();
+            var scene = _contextName != null && _contextTarget == 0;
+            var prompt = loadPersonality(scene);
             if (prompt != null)
             {
                 if (prompt.Length == 0) _personalityFeedback.text = L.T("読み込めませんでした。ログを確認してください", "Could not load. Check the log.");
                 else
                 {
                     _personalityInput.SetTextWithoutNotify(prompt);
-                    _personalityFeedback.text = L.T("読み込みました。『カードへ適用』で反映します", "Loaded. Press \"Apply to card\" to use it.");
+                    _personalityFeedback.text = scene
+                        ? L.T("読み込みました。『適用』で反映します", "Loaded. Press Apply to use it.")
+                        : L.T("読み込みました。『適用』でカードに反映します", "Loaded. Press Apply to use it for this girl.");
                 }
             }
         });
-        MakeButton(editor, L.T("別名で保存…", "Save as…"), new Vector2(297, -447), new Vector2(140, 34), () =>
+        MakeButton(editor, L.T("別名で保存…", "Save as…"), new Vector2(297, -487), new Vector2(140, 34), () =>
         {
-            var saved = savePersonalityFile(_personalityInput.text);
+            var scene = _contextName != null && _contextTarget == 0;
+            var saved = savePersonalityFile(_personalityInput.text, scene);
             if (saved.HasValue)
-                _personalityFeedback.text = saved.Value ? L.T("性格ファイルに保存しました", "Saved the personality file.") : L.T("保存できませんでした。入力とログを確認してください", "Could not save. Check the text and the log.");
+                _personalityFeedback.text = saved.Value ? (scene ? L.T("場面ファイルに保存しました", "Saved the scene context file.") : L.T("性格ファイルに保存しました", "Saved the personality file.")) : L.T("保存できませんでした。入力とログを確認してください", "Could not save. Check the text and the log.");
         });
-        MakeButton(editor, L.T("閉じる", "Close"), new Vector2(443, -447), new Vector2(137, 34), () => _personalityOverlay.SetActive(false));
-        _personalityFeedback = MakeText("PersonalityFeedback", editor, "", 14, new Vector2(20, -493), new Vector2(560, 42));
+        MakeButton(editor, L.T("閉じる", "Close"), new Vector2(443, -487), new Vector2(137, 34), () => _personalityOverlay.SetActive(false));
+        _personalityFeedback = MakeText("PersonalityFeedback", editor, "", 14, new Vector2(20, -533), new Vector2(560, 42));
         _personalityOverlay.SetActive(false);
 
         var settingsOverlay = MakeRect("BackendSettingsOverlay", _root.transform, Vector2.zero, new Vector2(1600, 900));
@@ -378,14 +398,43 @@ internal sealed class DedicatedChatUi : IDisposable
 
     }
 
-    // The H scene's male character and map, chosen here and kept in the cfg.
-    public void AddHSettings(Func<string> maleText, Action chooseMale, Action defaultMale,
-        Func<string> mapText, Action<int> cycleMap)
+    private TMP_Text _partnerLabel;
+    private Button[] _partnerButtons;
+
+    // A second girl on the chat stage: add (or replace) her, swap the two, or go back to one.
+    public void AddPartnerControls(Action add, Action swap, Action remove)
     {
+        var panel = _root.transform.Find("Panel").GetComponent<RectTransform>();
+        panel.sizeDelta = new Vector2(480, Mathf.Max(panel.sizeDelta.y, 800));
+        _partnerLabel = MakeText("PartnerLabel", panel, L.T("2人目: なし", "2nd girl: none"), 14, new Vector2(14, -764), new Vector2(172, 24));
+        _partnerButtons = new[]
+        {
+            MakeButton(panel, L.T("2人目を呼ぶ…", "Add 2nd…"), new Vector2(190, -760), new Vector2(104, 28), add),
+            MakeButton(panel, L.T("入れ替え", "Swap"), new Vector2(300, -760), new Vector2(76, 28), swap),
+            MakeButton(panel, L.T("1人に戻す", "Remove"), new Vector2(382, -760), new Vector2(84, 28), remove),
+        };
+        foreach (var button in _partnerButtons) button.GetComponentInChildren<TMP_Text>().fontSize = 14;
+    }
+
+    public void SetPartner(string name, bool interactable)
+    {
+        if (_partnerLabel == null) return;
+        var text = name == null ? L.T("2人目: なし", "2nd girl: none") : L.T($"2人目: {name}", $"2nd girl: {name}");
+        if (_partnerLabel.text != text) _partnerLabel.text = text;
+        _partnerButtons[0].interactable = interactable;
+        _partnerButtons[1].interactable = interactable && name != null;
+        _partnerButtons[2].interactable = interactable && name != null;
+    }
+
+    // The H scene's male character, optional second female and map, chosen here and kept in the cfg.
+    public void AddHSettings(Func<string> maleText, Action chooseMale, Action defaultMale,
+        Func<string> mapText, Action<int> cycleMap, Func<string> locationText, Action toggleLocation)
+    {
+        _hLocationText = locationText;
         _hMaleText = maleText;
         _hMapText = mapText;
         var overlay = _settingsOverlay.transform;
-        var panel = MakeRect("HSceneSettings", overlay, new Vector2(520, -215), new Vector2(560, 330));
+        var panel = MakeRect("HSceneSettings", overlay, new Vector2(520, -215), new Vector2(560, 334));
         panel.gameObject.AddComponent<Image>().color = new Color(0.09f, 0.11f, 0.17f, 1f);
         _hOverlay = panel.gameObject;
         MakeText("HTitle", panel, L.T("Hシーン設定", "H scene"), 22, new Vector2(22, -18), new Vector2(400, 32));
@@ -397,29 +446,70 @@ internal sealed class DedicatedChatUi : IDisposable
         MakeButton(panel, "◀", new Vector2(22, -212), new Vector2(40, 36), () => { cycleMap(-1); RefreshHSettings(); });
         _hMapLabel = MakeText("HMap", panel, "", 18, new Vector2(70, -218), new Vector2(250, 30), TextAlignmentOptions.Top);
         MakeButton(panel, "▶", new Vector2(328, -212), new Vector2(40, 36), () => { cycleMap(1); RefreshHSettings(); });
-        MakeButton(panel, L.T("閉じる", "Close"), new Vector2(410, -272), new Vector2(128, 40), () => _hOverlay.SetActive(false));
+        var location = MakeButton(panel, "", new Vector2(22, -276), new Vector2(370, 40), () => { toggleLocation(); RefreshHSettings(); });
+        _hLocationLabel = location.GetComponentInChildren<TMP_Text>();
+        MakeButton(panel, L.T("閉じる", "Close"), new Vector2(410, -276), new Vector2(128, 40), () => _hOverlay.SetActive(false));
         _hOverlay.SetActive(false);
     }
 
     // Shown when the character invites or accepts sex; the player decides whether to go to the H scene.
-    public void AddHInvite(Action accept)
+    // accept(with): 0 the first girl, 1 the second, -1 both (or the only girl on stage).
+    // watch: with two girls on stage, starts their girl-girl scene without the male.
+    public void AddHInvite(Action<int> accept, Action watch)
     {
-        _hInvite = MakeButton(_root.GetComponent<RectTransform>(), L.T("Hに進む", "Go to H"), new Vector2(1290, -850), new Vector2(150, 42), accept);
+        var root = _root.GetComponent<RectTransform>();
+        _hWatch = MakeButton(root, L.T("2人を見る", "Watch the girls"), new Vector2(1290, -706), new Vector2(150, 42), watch);
+        _hWatch.name = "HWatch";
+        _hWatch.targetGraphic.color = new Color(0.72f, 0.36f, 0.82f, 0.96f);
+        _hWatch.gameObject.SetActive(false);
+        _hGirlA = MakeButton(root, "", new Vector2(1290, -754), new Vector2(150, 42), () => accept(0));
+        _hGirlB = MakeButton(root, "", new Vector2(1290, -802), new Vector2(150, 42), () => accept(1));
+        foreach (var button in new[] { _hGirlA, _hGirlB })
+        {
+            button.targetGraphic.color = new Color(0.93f, 0.36f, 0.62f, 0.96f);
+            button.gameObject.SetActive(false);
+        }
+        _hInvite = MakeButton(root, L.T("Hに進む", "Go to H"), new Vector2(1290, -850), new Vector2(150, 42), () => accept(-1));
         _hInvite.name = "HInvite";
         // Pink like the dialogue window so it stands apart from the blue "Send" button.
         _hInvite.targetGraphic.color = new Color(0.93f, 0.36f, 0.62f, 0.96f);
         _hInvite.gameObject.SetActive(false);
     }
 
-    public void SetHInvite(bool visible)
+    // girlA/girlB: the two girls on stage, or null with one girl; each then gets her own button and the
+    // main button takes both.
+    public void SetHInvite(bool visible, string girlA = null, string girlB = null)
     {
-        if (_hInvite != null && _hInvite.gameObject.activeSelf != visible) _hInvite.gameObject.SetActive(visible);
+        if (_hInvite == null) return;
+        var duo = girlA != null && girlB != null;
+        if (_hInvite.gameObject.activeSelf != visible) _hInvite.gameObject.SetActive(visible);
+        if (_hGirlA.gameObject.activeSelf != (visible && duo)) _hGirlA.gameObject.SetActive(visible && duo);
+        if (_hGirlB.gameObject.activeSelf != (visible && duo)) _hGirlB.gameObject.SetActive(visible && duo);
+        if (!visible) return;
+        SetLabel(_hInvite, duo ? L.T("2人とH", "H with both") : L.T("Hに進む", "Go to H"));
+        if (duo)
+        {
+            SetLabel(_hGirlA, L.T($"{girlA}とH", $"H with {girlA}"));
+            SetLabel(_hGirlB, L.T($"{girlB}とH", $"H with {girlB}"));
+        }
+    }
+
+    private static void SetLabel(Button button, string text)
+    {
+        var label = button.GetComponentInChildren<TMP_Text>();
+        if (label != null && label.text != text) label.text = text;
+    }
+
+    public void SetHWatch(bool visible)
+    {
+        if (_hWatch != null && _hWatch.gameObject.activeSelf != visible) _hWatch.gameObject.SetActive(visible);
     }
 
     private void RefreshHSettings()
     {
         if (_hMaleLabel != null) _hMaleLabel.text = _hMaleText?.Invoke() ?? "";
         if (_hMapLabel != null) _hMapLabel.text = _hMapText?.Invoke() ?? "";
+        if (_hLocationLabel != null) _hLocationLabel.text = _hLocationText?.Invoke() ?? "";
     }
 
     public string InputText => _input?.text ?? "";
@@ -647,10 +737,39 @@ internal sealed class DedicatedChatUi : IDisposable
 
     private void OpenPersonalityEditor()
     {
-        _personalityInput.SetTextWithoutNotify(_savedPersonalityPrompt);
         _personalityFeedback.text = "";
         _personalityOverlay.SetActive(true);
+        if (_contextName != null) SelectContextTab(_contextTarget == 2 && _contextName(2) == null ? 1 : _contextTarget);
+        else _personalityInput.SetTextWithoutNotify(_savedPersonalityPrompt);
         _personalityInput.ActivateInputField();
+    }
+
+    // name(target) is null for a girl who is not on stage; text(target) is what is saved now; apply saves it.
+    public void ConfigureContextEditor(Func<int, string> name, Func<int, string> text, Func<int, string, bool> apply)
+    {
+        _contextName = name;
+        _contextText = text;
+        _contextApply = apply;
+    }
+
+    private void SelectContextTab(int target)
+    {
+        if (_contextName == null) return;
+        _contextTarget = target;
+        for (var tab = 0; tab < _contextTabs.Length; tab++)
+        {
+            var label = tab == 0 ? L.T("場面（全員）", "Scene (everyone)") : _contextName(tab);
+            _contextTabs[tab].gameObject.SetActive(label != null);
+            _contextTabs[tab].GetComponentInChildren<TMP_Text>().text = label ?? "";
+            _contextTabs[tab].GetComponent<Image>().color = tab == target ? new Color(0.15f, 0.4f, 0.62f, 0.96f) : new Color(0.2f, 0.23f, 0.3f, 0.96f);
+        }
+        _personalityTitle.text = target == 0 ? L.T("場面の説明", "Shared scene context") : L.T("性格・口調の指示", "Personality and speaking style");
+        _personalityHelp.text = target == 0
+            ? L.T("場所や状況、2人の関係など全員に共通する内容。空欄でも構いません。", "Where you are, the situation, how everyone knows each other. Applies to everyone; may be empty.")
+            : L.T("このキャラだけに適用されます。出力形式・動作ルールは編集対象外です。", "Applies only to this girl. Output format and action rules are not editable here.");
+        _savedPersonalityPrompt = _contextText(target) ?? "";
+        _personalityInput.SetTextWithoutNotify(_savedPersonalityPrompt);
+        _personalityFeedback.text = "";
     }
 
     public void OpenSettingsPanel(Func<BackendSettings> load) => OpenSettings(load);
